@@ -18,6 +18,7 @@ import type {
   HumanDecisionChannelRequest,
   HumanDecisionDeliveryRecord,
   HumanDecisionPrompt,
+  HumanDecisionProvenance,
   HumanDecisionRequest,
   HumanDecisionResponse,
   HumanDecisionSettlementRecord,
@@ -481,13 +482,15 @@ export class HumanDecisionStore {
   async accept(
     request: HumanDecisionRequest,
     submission: HumanDecisionSubmission,
+    provenance: Extract<HumanDecisionProvenance, "human" | "delegate"> = "human",
   ): Promise<HumanDecisionAcceptance> {
-    return this.acceptSync(request, submission);
+    return this.acceptSync(request, submission, provenance);
   }
 
   acceptSync(
     request: HumanDecisionRequest,
     submission: HumanDecisionSubmission,
+    provenance: Extract<HumanDecisionProvenance, "human" | "delegate"> = "human",
   ): HumanDecisionAcceptance {
     validateHumanDecisionRequestIntegrity(request);
     const normalized = validateHumanDecisionSubmission(request, submission);
@@ -501,7 +504,7 @@ export class HumanDecisionStore {
       decisionId: request.decisionId,
       requestDigest: request.requestDigest,
       response: validateHumanDecisionResponse(request, normalized),
-      provenance: "human",
+      provenance,
       source: normalized.source,
       idempotencyKey: normalized.idempotencyKey,
       acceptedAt: attemptedAt,
@@ -516,7 +519,7 @@ export class HumanDecisionStore {
     };
     return this.attemptAcceptance(request, decision, {
       attemptId,
-      source: "human",
+      source: provenance,
       actorId: normalized.source.actorId,
       channel: normalized.source.channel,
       candidate: normalized,
@@ -749,7 +752,7 @@ export class HumanDecisionStore {
     decision: ResolvedHumanDecision,
     attempt: {
       attemptId: string;
-      source: "human" | "policy";
+      source: "human" | "delegate" | "policy";
       actorId?: string;
       channel?: string;
       candidate: unknown;
@@ -764,7 +767,7 @@ export class HumanDecisionStore {
       const arbitrationTime =
         attempt.source === "policy" ? Date.parse(decision.acceptedAt) : Date.now();
       if (
-        attempt.source === "human" &&
+        attempt.source !== "policy" &&
         timing.deadlineAt !== null &&
         arbitrationTime > timing.deadlineAt
       ) {
@@ -829,7 +832,7 @@ export class HumanDecisionStore {
         )
         .run(
           request.decisionId,
-          decision.provenance === "timeout" ? "timeout_policy" : "human",
+          decision.provenance === "timeout" ? "timeout_policy" : decision.provenance,
           responseHash,
           attempt.channel ?? null,
           attempt.actorId ?? null,
@@ -842,7 +845,7 @@ export class HumanDecisionStore {
         row.resourceId,
         row.revision + 1,
         "decision.accepted",
-        decision.provenance === "timeout" ? "policy" : "human",
+        decision.provenance === "timeout" ? "policy" : decision.provenance,
         attempt.actorId ?? null,
         responseHash,
         now,
@@ -1186,8 +1189,8 @@ function channelIdFor(channel: string): string {
 
 function sameHumanAnswer(left: ResolvedHumanDecision, right: ResolvedHumanDecision): boolean {
   return (
-    left.provenance === "human" &&
-    right.provenance === "human" &&
+    (left.provenance === "human" || left.provenance === "delegate") &&
+    left.provenance === right.provenance &&
     left.idempotencyKey === right.idempotencyKey &&
     canonicalJson(left.response) === canonicalJson(right.response) &&
     canonicalJson(left.source) === canonicalJson(right.source)

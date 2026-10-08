@@ -2,6 +2,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { canonicalJson } from "../state/json.js";
 import { errorMessage } from "../workflows/errors.js";
+import { FleetGateAdapter } from "./fleet-gate.js";
 import {
   CHANNEL_ADAPTER_PROTOCOL_SCHEMA,
   channelStableMessageId,
@@ -59,13 +60,16 @@ class AdapterServerConnection {
 export async function runChannelAdapter(): Promise<number> {
   const launch = readLaunch();
   const server = new AdapterServerConnection(launch);
-  const telegram = new TelegramAdapter({
-    profile: launch.profile,
-    token: launch.token,
-    allowedUserIds: launch.allowedUserIds,
-    allowedChatIds: launch.allowedChatIds,
-    ...(launch.apiBase === undefined ? {} : { apiBase: launch.apiBase }),
-  });
+  const adapter =
+    launch.adapterType === "telegram"
+      ? new TelegramAdapter({
+          profile: launch.profile,
+          token: launch.token,
+          allowedUserIds: launch.allowedUserIds,
+          allowedChatIds: launch.allowedChatIds,
+          ...(launch.apiBase === undefined ? {} : { apiBase: launch.apiBase }),
+        })
+      : await FleetGateAdapter.fromLaunch(launch);
   let cursor = 0;
   let controlSequence = 0;
   const controlId = (kind: "ready" | "exiting") => {
@@ -107,7 +111,7 @@ export async function runChannelAdapter(): Promise<number> {
     }
     if (command.kind === "channel.present") {
       try {
-        const messages = await telegram.present(command.request);
+        const messages = await adapter.present(command.request);
         response = await server.report({
           kind: "channel.present",
           stableMessageId: command.stableMessageId,
@@ -133,14 +137,21 @@ export async function runChannelAdapter(): Promise<number> {
     }
     if (command.kind === "channel.settle") {
       try {
-        await telegram.settle(command.outcome, command.response, command.messages);
+        const result = await adapter.settle(
+          command.outcome,
+          command.response,
+          command.messages,
+          command.request,
+        );
+        const state = result?.state ?? "confirmed";
         response = await server.report({
           kind: "channel.settle",
           stableMessageId: command.stableMessageId,
           decisionId: command.request.decisionId,
           requestDigest: command.request.requestDigest,
           attemptId: command.attemptId,
-          state: "confirmed",
+          state,
+          ...(result?.state === "unknown" ? { errorCode: result.errorCode } : {}),
         });
       } catch (error) {
         response = await server.report({
@@ -156,8 +167,8 @@ export async function runChannelAdapter(): Promise<number> {
       continue;
     }
 
-    telegram.setRequests(command.requests);
-    const polled = await telegram.poll(command.cursor);
+    adapter.setRequests(command.requests);
+    const polled = await adapter.poll(command.cursor);
     cursor = polled.cursor;
     for (const answer of polled.answers) {
       await server.report({
@@ -173,7 +184,10 @@ export async function runChannelAdapter(): Promise<number> {
         actorId: answer.actorId,
         chatId: answer.chatId,
         eventId: answer.eventId,
-        idempotencyKey: `telegram:${launch.profile}:${answer.eventId}`,
+        idempotencyKey:
+          "idempotencyKey" in answer && typeof answer.idempotencyKey === "string"
+            ? answer.idempotencyKey
+            : `telegram:${launch.profile}:${answer.eventId}`,
         cursor,
       });
     }

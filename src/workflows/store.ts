@@ -3850,7 +3850,7 @@ export class WorkflowRunStore {
       requestDigest: request.requestDigest,
       nodeId: request.nodeId,
       response: decision.response as HumanDecisionReceipt["response"],
-      provenance: decision.provenance === "timeout" ? "timeout" : "human",
+      provenance: decision.provenance as HumanDecisionReceipt["provenance"],
       acceptedAt: decision.acceptedAt,
       answerDigest: decision.answerDigest,
       subjectDigest: decision.subjectDigest,

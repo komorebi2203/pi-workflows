@@ -155,6 +155,7 @@ describe("decision channel configuration", () => {
     const invalid = [
       { schema: "wrong", telegram: {} },
       { schema: "pi-workflows.credentials.v1", telegram: [] },
+      { schema: "pi-workflows.credentials.v1", fleetGate: [] },
       { schema: "pi-workflows.credentials.v1", telegram: { "bad/name": {} } },
       { schema: "pi-workflows.credentials.v1", telegram: { approval: null } },
       { schema: "pi-workflows.credentials.v1", telegram: { approval: {} } },
@@ -256,6 +257,145 @@ describe("decision channel configuration", () => {
     const loaded = await loadDecisionChannelConfig(configDir);
     expect(loaded?.channels.audiences.operator?.channels).toEqual(["pi", "telegram:approval"]);
     expect(loaded?.credentials.approval).toBe("fixture");
+  });
+
+  it("preserves delegate authority when adding Telegram to an existing audience", async () => {
+    const configDir = await makeTempDir("decision-setup-delegates");
+    const tokenFile = path.join(configDir, "token");
+    const envFile = path.join(configDir, "discord.env");
+    await fs.writeFile(tokenFile, "fixture", { mode: 0o600 });
+    await fs.writeFile(envFile, "DISCORD_VOICE_TOKEN=fleet-token\n", { mode: 0o600 });
+    await privateJson(path.join(configDir, "channels.json"), {
+      schema: "pi-workflows.channels.v1",
+      audiences: {
+        operator: {
+          channels: ["fleet-gate:dobby"],
+          accept: "first-valid-answer",
+          delegates: true,
+        },
+      },
+      fleetGateProfiles: {
+        dobby: {
+          credential: "dobby",
+          psiRoot: "/tmp/psi",
+          fleetCoreDir: "/tmp/fleet-core",
+          dobbyCharter: "/tmp/dobby.yaml",
+          roomId: "1516161412873982136",
+          actors: {
+            "fleet:dobby": "delegate",
+            "discord:722419769147654221": "human",
+          },
+          pickupMs: 1000,
+          answerMs: 2000,
+        },
+      },
+    });
+    await privateJson(path.join(configDir, "credentials.json"), {
+      schema: "pi-workflows.credentials.v1",
+      telegram: {},
+      fleetGate: { dobby: { envFile, variable: "DISCORD_VOICE_TOKEN" } },
+    });
+    await writeDecisionChannelProfile({
+      configDir,
+      audience: "operator",
+      profile: "approval",
+      credential: "approval",
+      tokenFile,
+      allowedUserIds: ["100"],
+      allowedChatIds: ["-200"],
+    });
+    const loaded = await loadDecisionChannelConfig(configDir);
+    expect(loaded?.channels.audiences.operator).toMatchObject({
+      channels: ["fleet-gate:dobby", "telegram:approval"],
+      delegates: true,
+    });
+  });
+
+  it("loads a fleet gate profile with a token from an env file", async () => {
+    const configDir = await makeTempDir("decision-fleet-gate");
+    const envFile = path.join(configDir, "discord.env");
+    await fs.writeFile(envFile, "DISCORD_VOICE_TOKEN=fixture-discord-token\n", { mode: 0o600 });
+    await privateJson(path.join(configDir, "channels.json"), {
+      schema: "pi-workflows.channels.v1",
+      audiences: {
+        operator: {
+          channels: ["fleet-gate:dobby"],
+          accept: "first-valid-answer",
+          delegates: true,
+        },
+      },
+      fleetGateProfiles: {
+        dobby: {
+          credential: "dobby",
+          psiRoot: "/tmp/psi",
+          fleetCoreDir: "/tmp/fleet-core",
+          dobbyCharter: "/tmp/dobby.yaml",
+          roomId: "1516161412873982136",
+          actors: {
+            "fleet:dobby": "delegate",
+            "discord:722419769147654221": "human",
+          },
+          pickupMs: 1000,
+          answerMs: 2000,
+        },
+      },
+    });
+    await privateJson(path.join(configDir, "credentials.json"), {
+      schema: "pi-workflows.credentials.v1",
+      fleetGate: { dobby: { envFile, variable: "DISCORD_VOICE_TOKEN" } },
+    });
+    const loaded = await loadDecisionChannelConfig(configDir);
+    expect(loaded?.credentials.dobby).toBe("fixture-discord-token");
+    expect(loaded?.channels.audiences.operator?.delegates).toBe(true);
+    expect(loaded?.channels.fleetGateProfiles?.dobby?.actors["fleet:dobby"]).toBe("delegate");
+  });
+
+  it("rejects a credential id reused across Telegram and fleet gate profiles", async () => {
+    const configDir = await makeTempDir("decision-credential-cross-type");
+    const tokenFile = path.join(configDir, "telegram-token");
+    const envFile = path.join(configDir, "discord.env");
+    await fs.writeFile(tokenFile, "telegram-token", { mode: 0o600 });
+    await fs.writeFile(envFile, "DISCORD_VOICE_TOKEN=fleet-token\n", { mode: 0o600 });
+    await privateJson(path.join(configDir, "channels.json"), {
+      schema: "pi-workflows.channels.v1",
+      audiences: {
+        operator: {
+          channels: ["telegram:approval", "fleet-gate:dobby"],
+          accept: "first-valid-answer",
+          delegates: true,
+        },
+      },
+      telegramProfiles: {
+        approval: {
+          credential: "shared",
+          allowedUserIds: ["100"],
+          allowedChatIds: ["-200"],
+        },
+      },
+      fleetGateProfiles: {
+        dobby: {
+          credential: "shared",
+          psiRoot: "/tmp/psi",
+          fleetCoreDir: "/tmp/fleet-core",
+          dobbyCharter: "/tmp/dobby.yaml",
+          roomId: "1516161412873982136",
+          actors: {
+            "fleet:dobby": "delegate",
+            "discord:722419769147654221": "human",
+          },
+          pickupMs: 1000,
+          answerMs: 2000,
+        },
+      },
+    });
+    await privateJson(path.join(configDir, "credentials.json"), {
+      schema: "pi-workflows.credentials.v1",
+      telegram: { shared: { tokenFile } },
+      fleetGate: { shared: { envFile, variable: "DISCORD_VOICE_TOKEN" } },
+    });
+    await expect(loadDecisionChannelConfig(configDir)).rejects.toThrow(
+      /both telegram and fleet-gate/,
+    );
   });
 
   it("rejects invalid setup values", async () => {

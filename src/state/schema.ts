@@ -91,7 +91,7 @@ CREATE TABLE events (
   resource_revision INTEGER NOT NULL CHECK (resource_revision > 0),
   event_type TEXT NOT NULL,
   actor_type TEXT NOT NULL CHECK (actor_type IN (
-    'session', 'server', 'resource_manager', 'channel', 'human', 'policy', 'control', 'system'
+    'session', 'server', 'resource_manager', 'channel', 'human', 'delegate', 'policy', 'control', 'system'
   )),
   actor_id TEXT,
   lease_generation INTEGER CHECK (lease_generation IS NULL OR lease_generation > 0),
@@ -238,7 +238,7 @@ CREATE TABLE workflow_setting_changes (
   request_id TEXT NOT NULL,
   change_number INTEGER NOT NULL CHECK (change_number > 0),
   actor_type TEXT NOT NULL CHECK (actor_type IN (
-    'session', 'server', 'resource_manager', 'channel', 'human', 'policy', 'control', 'system'
+    'session', 'server', 'resource_manager', 'channel', 'human', 'delegate', 'policy', 'control', 'system'
   )),
   actor_id TEXT,
   source_type TEXT NOT NULL,
@@ -258,7 +258,7 @@ CREATE TABLE workflow_follow_ups (
   order_number INTEGER NOT NULL CHECK (order_number > 0),
   target_session_id TEXT NOT NULL,
   actor_type TEXT NOT NULL CHECK (actor_type IN (
-    'session', 'server', 'resource_manager', 'channel', 'human', 'policy', 'control', 'system'
+    'session', 'server', 'resource_manager', 'channel', 'human', 'delegate', 'policy', 'control', 'system'
   )),
   actor_id TEXT,
   source_type TEXT NOT NULL,
@@ -649,7 +649,7 @@ CREATE TABLE human_decision_resolutions (
   decision_id TEXT PRIMARY KEY REFERENCES human_decisions(decision_id) ON DELETE CASCADE,
   outcome TEXT NOT NULL CHECK (outcome IN ('accepted', 'cancelled')),
   provenance TEXT NOT NULL CHECK (provenance IN (
-    'human', 'timeout_policy', 'explicit_cancel', 'expired_no_default'
+    'human', 'delegate', 'timeout_policy', 'explicit_cancel', 'expired_no_default'
   )),
   response_hash BLOB REFERENCES blobs(blob_hash),
   reason TEXT,
@@ -667,7 +667,7 @@ CREATE TABLE human_decision_resolutions (
 CREATE TABLE human_decision_submissions (
   decision_id TEXT NOT NULL REFERENCES human_decisions(decision_id) ON DELETE CASCADE,
   attempt_id TEXT NOT NULL,
-  source TEXT NOT NULL CHECK (source IN ('human', 'policy', 'control', 'channel')),
+  source TEXT NOT NULL CHECK (source IN ('human', 'delegate', 'policy', 'control', 'channel')),
   actor_id TEXT,
   channel TEXT,
   candidate_hash BLOB NOT NULL REFERENCES blobs(blob_hash),

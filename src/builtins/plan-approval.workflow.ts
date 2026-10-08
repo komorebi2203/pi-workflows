@@ -46,6 +46,7 @@ export type NormalizedPlanApprovalInput = Omit<PlanApprovalInput, "approval"> & 
 export type PlanApprovalResolution =
   | { provenance: "skipped"; revision: number }
   | { provenance: "human"; decision: HumanDecisionReceipt }
+  | { provenance: "delegate"; decision: HumanDecisionReceipt }
   | { provenance: "timeout"; decision: HumanDecisionReceipt };
 
 export type PlanApprovalContinue = {
@@ -191,6 +192,7 @@ function decisionResolution(
   value: HumanDecisionReceipt | undefined,
 ):
   | { provenance: "human"; decision: HumanDecisionReceipt }
+  | { provenance: "delegate"; decision: HumanDecisionReceipt }
   | { provenance: "timeout"; decision: HumanDecisionReceipt } {
   if (value === undefined) throw new Error("plan approval decision receipt is missing");
   return { provenance: value.provenance, decision: value };

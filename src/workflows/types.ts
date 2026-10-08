@@ -360,17 +360,19 @@ export type HumanDecisionSubmission = HumanDecisionResponse & {
   idempotencyKey: string;
 };
 
+export type HumanDecisionProvenance = "human" | "delegate" | "timeout";
+
 type ResolvedHumanDecisionCommon = {
   decisionId: string;
   requestDigest: string;
   response: HumanDecisionResponse;
-  provenance: "human" | "timeout";
+  provenance: HumanDecisionProvenance;
   acceptedAt: string;
   answerDigest: string;
 };
 
 type AcceptedHumanDecisionCommon = ResolvedHumanDecisionCommon & {
-  provenance: "human";
+  provenance: "human" | "delegate";
   source: HumanDecisionAnswerSource;
   idempotencyKey: string;
 };
@@ -399,7 +401,7 @@ type HumanDecisionReceiptCommon = {
   requestDigest: string;
   nodeId: string;
   response: HumanDecisionResponse;
-  provenance: "human" | "timeout";
+  provenance: HumanDecisionProvenance;
   acceptedAt: string;
   answerDigest: string;
 };

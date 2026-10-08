@@ -9,7 +9,7 @@ const SIMPLE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 
 export type DecisionChannelConfig = {
   schema: "pi-workflows.channels.v1";
-  audiences: Record<string, { channels: string[]; accept: "first-valid-answer" }>;
+  audiences: Record<string, { channels: string[]; accept: "first-valid-answer"; delegates?: true }>;
   telegramProfiles?: Record<
     string,
     {
@@ -18,11 +18,25 @@ export type DecisionChannelConfig = {
       allowedChatIds: string[];
     }
   >;
+  fleetGateProfiles?: Record<
+    string,
+    {
+      credential: string;
+      psiRoot: string;
+      fleetCoreDir: string;
+      dobbyCharter: string;
+      roomId: string;
+      actors: Record<string, "human" | "delegate">;
+      pickupMs: number;
+      answerMs: number;
+    }
+  >;
 };
 
 export type DecisionCredentialConfig = {
   schema: "pi-workflows.credentials.v1";
   telegram: Record<string, { tokenFile: string }>;
+  fleetGate: Record<string, { envFile: string; variable: string }>;
 };
 
 export type LoadedDecisionChannelConfig = {
@@ -57,7 +71,26 @@ export async function loadDecisionChannelConfig(
   }
   await requirePrivateFile(channelPath, "pi-workflows channel profile");
   const channels = parseChannelConfig(channelsRaw);
-  const profiles = Object.values(channels.telegramProfiles ?? {});
+  const profiles = [
+    ...Object.values(channels.telegramProfiles ?? {}).map((profile) => ({
+      type: "telegram" as const,
+      credential: profile.credential,
+    })),
+    ...Object.values(channels.fleetGateProfiles ?? {}).map((profile) => ({
+      type: "fleet-gate" as const,
+      credential: profile.credential,
+    })),
+  ];
+  const credentialTypes = new Map<string, (typeof profiles)[number]["type"]>();
+  for (const profile of profiles) {
+    const priorType = credentialTypes.get(profile.credential);
+    if (priorType !== undefined && priorType !== profile.type) {
+      throw new Error(
+        `Decision credential ${profile.credential} is used by both ${priorType} and ${profile.type} profiles`,
+      );
+    }
+    credentialTypes.set(profile.credential, profile.type);
+  }
   if (profiles.length === 0) return { channels, credentials: {}, configDir };
 
   const credentialPath = path.join(configDir, "credentials.json");
@@ -67,20 +100,12 @@ export async function loadDecisionChannelConfig(
   );
   const credentials: Record<string, string> = {};
   for (const profile of profiles) {
-    const credential = credentialsConfig.telegram[profile.credential];
-    if (credential === undefined) {
-      throw new Error(`Telegram credential ${profile.credential} is not configured`);
-    }
-    if (!path.isAbsolute(credential.tokenFile)) {
-      throw new Error(`Telegram credential ${profile.credential} tokenFile must be absolute`);
-    }
-    await requirePrivateFile(
-      credential.tokenFile,
-      `Telegram credential ${profile.credential} token file`,
-    );
-    const token = (await fs.readFile(credential.tokenFile, "utf8")).trim();
+    const token =
+      profile.type === "telegram"
+        ? await loadTelegramCredential(credentialsConfig, profile.credential)
+        : await loadFleetGateCredential(credentialsConfig, profile.credential);
     if (token.length === 0) {
-      throw new Error(`Telegram credential ${profile.credential} token file is empty`);
+      throw new Error(`${profile.type} credential ${profile.credential} is empty`);
     }
     credentials[profile.credential] = token;
   }
@@ -145,7 +170,11 @@ export async function writeDecisionChannelProfile(options: {
       : parseChannelConfig(existingChannels);
   const credentials =
     existingCredentials === null
-      ? ({ schema: "pi-workflows.credentials.v1", telegram: {} } satisfies DecisionCredentialConfig)
+      ? ({
+          schema: "pi-workflows.credentials.v1",
+          telegram: {},
+          fleetGate: {},
+        } satisfies DecisionCredentialConfig)
       : parseCredentialConfig(existingCredentials);
 
   channels.telegramProfiles = {
@@ -161,6 +190,7 @@ export async function writeDecisionChannelProfile(options: {
   channels.audiences[options.audience] = {
     channels: [...new Set([...(priorAudience?.channels ?? ["pi"]), channelId])],
     accept: "first-valid-answer",
+    ...(priorAudience?.delegates === true ? { delegates: true } : {}),
   };
   credentials.telegram[options.credential] = { tokenFile: options.tokenFile };
   await writePrivateJson(channelPath, channels);
@@ -182,7 +212,14 @@ export function parseChannelConfig(value: unknown): DecisionChannelConfig {
     if (record.accept !== "first-valid-answer") {
       throw new Error(`Decision audience ${audience} accept policy is invalid`);
     }
-    audiences[audience] = { channels, accept: "first-valid-answer" };
+    if (record.delegates !== undefined && record.delegates !== true) {
+      throw new Error(`Decision audience ${audience} delegates flag is invalid`);
+    }
+    audiences[audience] = {
+      channels,
+      accept: "first-valid-answer",
+      ...(record.delegates === true ? { delegates: true } : {}),
+    };
   }
   const telegramProfiles: NonNullable<DecisionChannelConfig["telegramProfiles"]> = {};
   if (input.telegramProfiles !== undefined) {
@@ -207,13 +244,59 @@ export function parseChannelConfig(value: unknown): DecisionChannelConfig {
       telegramProfiles[name] = { credential, allowedUserIds, allowedChatIds };
     }
   }
+  const fleetGateProfiles: NonNullable<DecisionChannelConfig["fleetGateProfiles"]> = {};
+  if (input.fleetGateProfiles !== undefined) {
+    const profiles = requireRecord(input.fleetGateProfiles, "Fleet gate profiles");
+    for (const [name, raw] of Object.entries(profiles)) {
+      requireSimpleId(name, "Fleet gate profile");
+      const profile = requireRecord(raw, `Fleet gate profile ${name}`);
+      const credential = requireSimpleId(
+        profile.credential,
+        `Fleet gate profile ${name} credential`,
+      );
+      const psiRoot = requireAbsolutePath(profile.psiRoot, `Fleet gate profile ${name} psiRoot`);
+      const fleetCoreDir = requireAbsolutePath(
+        profile.fleetCoreDir,
+        `Fleet gate profile ${name} fleetCoreDir`,
+      );
+      const dobbyCharter = requireAbsolutePath(
+        profile.dobbyCharter,
+        `Fleet gate profile ${name} dobbyCharter`,
+      );
+      const roomId = requireString(profile.roomId, `Fleet gate profile ${name} roomId`);
+      const actors = parseActors(profile.actors, `Fleet gate profile ${name} actors`);
+      const pickupMs = optionalPositiveInteger(
+        profile.pickupMs,
+        `Fleet gate profile ${name} pickupMs`,
+        120_000,
+      );
+      const answerMs = optionalPositiveInteger(
+        profile.answerMs,
+        `Fleet gate profile ${name} answerMs`,
+        600_000,
+      );
+      fleetGateProfiles[name] = {
+        credential,
+        psiRoot,
+        fleetCoreDir,
+        dobbyCharter,
+        roomId,
+        actors,
+        pickupMs,
+        answerMs,
+      };
+    }
+  }
   for (const [audience, rule] of Object.entries(audiences)) {
     for (const channel of rule.channels) {
       if (channel === "pi") continue;
-      if (
-        !channel.startsWith("telegram:") ||
-        telegramProfiles[channel.slice("telegram:".length)] === undefined
-      ) {
+      const knownTelegram =
+        channel.startsWith("telegram:") &&
+        telegramProfiles[channel.slice("telegram:".length)] !== undefined;
+      const knownFleetGate =
+        channel.startsWith("fleet-gate:") &&
+        fleetGateProfiles[channel.slice("fleet-gate:".length)] !== undefined;
+      if (!knownTelegram && !knownFleetGate) {
         throw new Error(`Decision audience ${audience} references unknown channel ${channel}`);
       }
     }
@@ -222,6 +305,7 @@ export function parseChannelConfig(value: unknown): DecisionChannelConfig {
     schema: "pi-workflows.channels.v1",
     audiences,
     ...(Object.keys(telegramProfiles).length === 0 ? {} : { telegramProfiles }),
+    ...(Object.keys(fleetGateProfiles).length === 0 ? {} : { fleetGateProfiles }),
   };
 }
 
@@ -230,14 +314,55 @@ export function parseCredentialConfig(value: unknown): DecisionCredentialConfig 
   if (input.schema !== "pi-workflows.credentials.v1") {
     throw new Error("Decision credential configuration schema is invalid");
   }
-  const telegramInput = requireRecord(input.telegram, "Telegram credentials");
+  const telegramInput = requireRecord(input.telegram ?? {}, "Telegram credentials");
   const telegram: DecisionCredentialConfig["telegram"] = {};
   for (const [name, raw] of Object.entries(telegramInput)) {
     requireSimpleId(name, "Telegram credential");
     const credential = requireRecord(raw, `Telegram credential ${name}`);
     telegram[name] = { tokenFile: requireString(credential.tokenFile, "Telegram tokenFile") };
   }
-  return { schema: "pi-workflows.credentials.v1", telegram };
+  const fleetGateInput = requireRecord(input.fleetGate ?? {}, "Fleet gate credentials");
+  const fleetGate: DecisionCredentialConfig["fleetGate"] = {};
+  for (const [name, raw] of Object.entries(fleetGateInput)) {
+    requireSimpleId(name, "Fleet gate credential");
+    const credential = requireRecord(raw, `Fleet gate credential ${name}`);
+    fleetGate[name] = {
+      envFile: requireString(credential.envFile, "Fleet gate envFile"),
+      variable: requireSimpleId(credential.variable, "Fleet gate variable"),
+    };
+  }
+  return { schema: "pi-workflows.credentials.v1", telegram, fleetGate };
+}
+
+async function loadTelegramCredential(
+  config: DecisionCredentialConfig,
+  name: string,
+): Promise<string> {
+  const credential = config.telegram[name];
+  if (credential === undefined) throw new Error(`Telegram credential ${name} is not configured`);
+  if (!path.isAbsolute(credential.tokenFile)) {
+    throw new Error(`Telegram credential ${name} tokenFile must be absolute`);
+  }
+  await requirePrivateFile(credential.tokenFile, `Telegram credential ${name} token file`);
+  return (await fs.readFile(credential.tokenFile, "utf8")).trim();
+}
+
+async function loadFleetGateCredential(
+  config: DecisionCredentialConfig,
+  name: string,
+): Promise<string> {
+  const credential = config.fleetGate[name];
+  if (credential === undefined) throw new Error(`Fleet gate credential ${name} is not configured`);
+  if (!path.isAbsolute(credential.envFile)) {
+    throw new Error(`Fleet gate credential ${name} envFile must be absolute`);
+  }
+  await requirePrivateFile(credential.envFile, `Fleet gate credential ${name} env file`);
+  const env = parseEnvFile(await fs.readFile(credential.envFile, "utf8"));
+  const token = env[credential.variable];
+  if (token === undefined || token.trim().length === 0) {
+    throw new Error(`Fleet gate credential ${name} variable is missing`);
+  }
+  return token.trim();
 }
 
 async function requirePrivateFile(filePath: string, label: string): Promise<void> {
@@ -266,6 +391,54 @@ function validateNumericIds(values: readonly string[], label: string): void {
   if (values.some((value) => !NUMERIC_ID.test(value))) {
     throw new Error(`${label} must contain only numeric IDs`);
   }
+}
+
+function parseActors(value: unknown, label: string): Record<string, "human" | "delegate"> {
+  const input = requireRecord(value, label);
+  const actors: Record<string, "human" | "delegate"> = {};
+  for (const [actorId, rawKind] of Object.entries(input)) {
+    const kind = rawKind === "person" ? "human" : rawKind;
+    if (kind !== "human" && kind !== "delegate") {
+      throw new Error(`${label} has an invalid actor kind`);
+    }
+    actors[actorId] = kind;
+  }
+  if (Object.keys(actors).length === 0) throw new Error(`${label} must not be empty`);
+  return actors;
+}
+
+function requireAbsolutePath(value: unknown, label: string): string {
+  const text = requireString(value, label);
+  if (!path.isAbsolute(text)) throw new Error(`${label} must be absolute`);
+  return text;
+}
+
+function optionalPositiveInteger(value: unknown, label: string, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || (value as number) <= 0) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return value as number;
+}
+
+function parseEnvFile(text: string): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const rawLine of text.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || line.startsWith("#")) continue;
+    const separator = line.indexOf("=");
+    if (separator <= 0) continue;
+    const key = line.slice(0, separator).trim();
+    let value = line.slice(separator + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    values[key] = value;
+  }
+  return values;
 }
 
 function requireSimpleId(value: unknown, label: string): string {

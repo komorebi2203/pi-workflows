@@ -12,6 +12,10 @@ export type TelegramMessageReference = {
   contentDigest: string;
 };
 
+export type ChannelPollRequest = HumanDecisionChannelRequest & {
+  messages: TelegramMessageReference[];
+};
+
 type ChannelAdapterMessageBase = {
   schema: typeof CHANNEL_ADAPTER_PROTOCOL_SCHEMA;
   adapterEpoch: string;
@@ -78,7 +82,7 @@ export type ChannelAdapterCommand =
   | {
       kind: "channel.poll";
       cursor: number;
-      requests: HumanDecisionChannelRequest[];
+      requests: ChannelPollRequest[];
     }
   | { kind: "channel.stop" };
 
@@ -94,13 +98,28 @@ export type ChannelAdapterResponse = {
 
 export type ChannelAdapterLaunch = {
   schema: "pi-workflows.channel-adapter-launch.v1";
+  adapterType: "telegram" | "fleet-gate";
   adapterEpoch: string;
   profile: string;
   token: string;
-  allowedUserIds: string[];
-  allowedChatIds: string[];
   apiBase?: string;
-};
+} & (
+  | {
+      adapterType: "telegram";
+      allowedUserIds: string[];
+      allowedChatIds: string[];
+    }
+  | {
+      adapterType: "fleet-gate";
+      psiRoot: string;
+      fleetCoreDir: string;
+      dobbyCharter: string;
+      roomId: string;
+      actors: Record<string, "human" | "delegate">;
+      pickupMs: number;
+      answerMs: number;
+    }
+);
 
 export function encodeChannelLine(value: ChannelAdapterMessage | ChannelAdapterResponse): Buffer {
   return Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
@@ -164,12 +183,23 @@ export function parseChannelAdapterLaunch(value: unknown): ChannelAdapterLaunch 
   if (launch.schema !== "pi-workflows.channel-adapter-launch.v1") {
     throw new Error("Channel adapter launch envelope is invalid");
   }
+  requireOneOf(launch.adapterType, ["telegram", "fleet-gate"], "channel adapter type");
   requireText(launch.adapterEpoch, "adapterEpoch");
   requireText(launch.profile, "profile");
   requireText(launch.token, "token");
-  requireStringArray(launch.allowedUserIds, "allowedUserIds");
-  requireStringArray(launch.allowedChatIds, "allowedChatIds");
   requireOptionalText(launch.apiBase, "apiBase");
+  if (launch.adapterType === "telegram") {
+    requireStringArray(launch.allowedUserIds, "allowedUserIds");
+    requireStringArray(launch.allowedChatIds, "allowedChatIds");
+  } else {
+    requireText(launch.psiRoot, "psiRoot");
+    requireText(launch.fleetCoreDir, "fleetCoreDir");
+    requireText(launch.dobbyCharter, "dobbyCharter");
+    requireText(launch.roomId, "roomId");
+    validateActors(launch.actors);
+    requirePositiveInteger(launch.pickupMs, "pickupMs");
+    requirePositiveInteger(launch.answerMs, "answerMs");
+  }
   return launch as ChannelAdapterLaunch;
 }
 
@@ -229,10 +259,17 @@ function validateCommand(value: unknown): void {
   if (command.kind === "channel.poll") {
     requireNonNegativeInteger(command.cursor, "channel cursor");
     if (!Array.isArray(command.requests)) throw new Error("Channel poll requests are invalid");
-    command.requests.forEach(validateChannelRequest);
+    command.requests.forEach(validatePollRequest);
     return;
   }
   throw new Error("Channel adapter command kind is invalid");
+}
+
+function validatePollRequest(value: unknown): void {
+  validateChannelRequest(value);
+  const request = requireObject(value, "channel poll request");
+  if (!Array.isArray(request.messages)) throw new Error("Channel poll messages are invalid");
+  request.messages.forEach(validateMessageReference);
 }
 
 function validateChannelRequest(value: unknown): void {
@@ -282,6 +319,14 @@ function validateMessageReference(value: unknown): void {
   requireNonNegativeInteger(reference.recipientIndex, "Telegram recipient index");
   requireNonNegativeInteger(reference.partIndex, "Telegram part index");
   requireText(reference.contentDigest, "Telegram content digest");
+}
+
+function validateActors(value: unknown): void {
+  const actors = requireObject(value, "fleet gate actors");
+  if (Object.keys(actors).length === 0) throw new Error("fleet gate actors are invalid");
+  for (const kind of Object.values(actors)) {
+    requireOneOf(kind, ["human", "delegate"], "fleet gate actor kind");
+  }
 }
 
 function requireObject(value: unknown, label: string): Record<string, unknown> {

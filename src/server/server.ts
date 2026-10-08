@@ -13,6 +13,7 @@ import {
   type ChannelAdapterLaunch,
   type ChannelAdapterMessage,
   type ChannelAdapterResponse,
+  type ChannelPollRequest,
   type TelegramMessageReference,
 } from "../channels/protocol.js";
 import { WorkflowClient } from "../client/client.js";
@@ -87,6 +88,7 @@ import type {
   HumanDecisionCancellationRecord,
   HumanDecisionChannelRequest,
   HumanDecisionDeliveryRecord,
+  HumanDecisionProvenance,
   HumanDecisionRequest,
   HumanDecisionResponse,
   HumanDecisionSettlementRecord,
@@ -222,6 +224,7 @@ type SessionCoordinator = {
 
 type ActiveChannel = {
   profile: string;
+  adapterType: ChannelAdapterLaunch["adapterType"];
   channelId: string;
   resourceId: string;
   launch: ChannelAdapterLaunch;
@@ -2495,6 +2498,7 @@ export class WorkflowServer {
         eventId: command.idempotencyKey,
       },
       idempotencyKey: command.idempotencyKey,
+      provenance: "human",
       submissionId: requireString(payload.submissionId, "submissionId"),
       expectedRevision: requireNonNegativeInteger(command.expectedRevision, "expectedRevision"),
       afterCommit,
@@ -2507,17 +2511,22 @@ export class WorkflowServer {
     response: HumanDecisionResponse;
     source: HumanDecisionAnswerSource;
     idempotencyKey: string;
+    provenance: Extract<HumanDecisionProvenance, "human" | "delegate">;
     submissionId: string;
     expectedRevision: number;
     afterCommit: Array<() => void>;
   }): Omit<ClientResponse, "schema" | "type" | "requestId"> {
-    const accepted = this.decisions.acceptSync(options.request, {
-      ...options.response,
-      decisionId: options.request.decisionId,
-      requestDigest: options.request.requestDigest,
-      source: options.source,
-      idempotencyKey: options.idempotencyKey,
-    });
+    const accepted = this.decisions.acceptSync(
+      options.request,
+      {
+        ...options.response,
+        decisionId: options.request.decisionId,
+        requestDigest: options.request.requestDigest,
+        source: options.source,
+        idempotencyKey: options.idempotencyKey,
+      },
+      options.provenance,
+    );
     if (accepted.status === "conflict") {
       return { outcome: "conflict", error: "Another human decision answer already won" };
     }
@@ -2743,7 +2752,18 @@ export class WorkflowServer {
   }
 
   private decisionChannelStatus(): JsonValue {
-    const configuredProfiles = Object.keys(this.decisionChannelConfig?.telegramProfiles ?? {});
+    const configuredProfiles = [
+      ...Object.keys(this.decisionChannelConfig?.telegramProfiles ?? {}).map((profile) => ({
+        adapterType: "telegram",
+        profile,
+        channelId: `telegram:${profile}`,
+      })),
+      ...Object.keys(this.decisionChannelConfig?.fleetGateProfiles ?? {}).map((profile) => ({
+        adapterType: "fleet-gate",
+        profile,
+        channelId: `fleet-gate:${profile}`,
+      })),
+    ];
     const ambiguous = this.channelEffects.listAmbiguous().map((effect) => ({
       profile: effect.payload.profile,
       messageId: channelEffectAttemptId(effect.effectId, effect.attemptNumber),
@@ -2752,8 +2772,9 @@ export class WorkflowServer {
     return {
       configured: this.decisionChannelConfig !== null,
       profiles: configuredProfiles.map((profile) => ({
-        profile,
-        running: this.activeChannels.has(profile),
+        adapterType: profile.adapterType,
+        profile: profile.profile,
+        running: this.activeChannels.has(profile.channelId),
       })),
       ambiguous,
       error: this.decisionChannelError,
@@ -2848,6 +2869,7 @@ export class WorkflowServer {
           throw new Error(`Telegram credential ${config.credential} is missing`);
         await this.startDecisionChannel({
           schema: "pi-workflows.channel-adapter-launch.v1",
+          adapterType: "telegram",
           adapterEpoch: `channel-adapter-${randomUUID()}`,
           profile,
           token,
@@ -2856,6 +2878,28 @@ export class WorkflowServer {
           ...(this.options.env?.PI_WORKFLOWS_TELEGRAM_API_BASE === undefined
             ? {}
             : { apiBase: this.options.env.PI_WORKFLOWS_TELEGRAM_API_BASE }),
+        });
+      }
+      for (const [profile, config] of Object.entries(loaded.channels.fleetGateProfiles ?? {})) {
+        const token = loaded.credentials[config.credential];
+        if (token === undefined)
+          throw new Error(`Fleet gate credential ${config.credential} is missing`);
+        await this.startDecisionChannel({
+          schema: "pi-workflows.channel-adapter-launch.v1",
+          adapterType: "fleet-gate",
+          adapterEpoch: `channel-adapter-${randomUUID()}`,
+          profile,
+          token,
+          psiRoot: config.psiRoot,
+          fleetCoreDir: config.fleetCoreDir,
+          dobbyCharter: config.dobbyCharter,
+          roomId: config.roomId,
+          actors: config.actors,
+          pickupMs: config.pickupMs,
+          answerMs: config.answerMs,
+          ...(this.options.env?.PI_WORKFLOWS_DISCORD_API_BASE === undefined
+            ? {}
+            : { apiBase: this.options.env.PI_WORKFLOWS_DISCORD_API_BASE }),
         });
       }
       return this.decisionChannelStatus();
@@ -2869,13 +2913,13 @@ export class WorkflowServer {
   }
 
   private async startDecisionChannel(launch: ChannelAdapterLaunch): Promise<void> {
-    if (this.stopping || this.activeChannels.has(launch.profile)) return;
-    const channelId = `telegram:${launch.profile}`;
+    const channelId = `${launch.adapterType}:${launch.profile}`;
+    if (this.stopping || this.activeChannels.has(channelId)) return;
     const resourceId = resourceIdFor("channel", channelId);
     this.ensureChannelResource(channelId, launch.profile, resourceId);
     const supervisor = new ChannelAdapterSupervisor(launch, {
       registry: this.registry,
-      onMessage: async (message) => await this.handleChannelMessage(launch.profile, message),
+      onMessage: async (message) => await this.handleChannelMessage(channelId, message),
       ...(this.options.env === undefined ? {} : { env: this.options.env }),
       ...(this.options.channelAdapterEntryPath === undefined
         ? {}
@@ -2884,6 +2928,7 @@ export class WorkflowServer {
     });
     const active: ActiveChannel = {
       profile: launch.profile,
+      adapterType: launch.adapterType,
       channelId,
       resourceId,
       launch,
@@ -2891,11 +2936,11 @@ export class WorkflowServer {
       inFlight: new Set(),
       stopping: false,
     };
-    this.activeChannels.set(launch.profile, active);
+    this.activeChannels.set(channelId, active);
     try {
       await supervisor.start();
     } catch (error) {
-      this.activeChannels.delete(launch.profile);
+      this.activeChannels.delete(channelId);
       throw error;
     }
     void supervisor.wait().then(async (result) => {
@@ -2922,24 +2967,59 @@ export class WorkflowServer {
       this.state.connection
         .prepare(
           `INSERT INTO channels(channel_id, resource_id, adapter_type, profile_key, created_at)
-           VALUES (?, ?, 'telegram', ?, ?) ON CONFLICT(channel_id) DO NOTHING`,
+           VALUES (?, ?, ?, ?, ?) ON CONFLICT(channel_id) DO NOTHING`,
         )
-        .run(channelId, resourceId, profile, now);
+        .run(channelId, resourceId, channelId.split(":", 1)[0], profile, now);
     });
   }
 
+  private isChannelConfigured(channelId: string): boolean {
+    if (channelId.startsWith("telegram:")) {
+      return (
+        this.decisionChannelConfig?.telegramProfiles?.[channelId.slice("telegram:".length)] !==
+        undefined
+      );
+    }
+    if (channelId.startsWith("fleet-gate:")) {
+      return (
+        this.decisionChannelConfig?.fleetGateProfiles?.[channelId.slice("fleet-gate:".length)] !==
+        undefined
+      );
+    }
+    return false;
+  }
+
+  private channelAnswerProvenance(
+    active: ActiveChannel,
+    message: Extract<ChannelAdapterMessage, { kind: "channel.answer" }>,
+  ): Extract<HumanDecisionProvenance, "human" | "delegate"> {
+    if (active.adapterType === "telegram") {
+      const config = this.decisionChannelConfig?.telegramProfiles?.[active.profile];
+      if (
+        config === undefined ||
+        !config.allowedUserIds.includes(message.actorId) ||
+        !config.allowedChatIds.includes(message.chatId)
+      ) {
+        throw new Error("Telegram answer source is not authorized by the server profile");
+      }
+      return "human";
+    }
+    const config = this.decisionChannelConfig?.fleetGateProfiles?.[active.profile];
+    const provenance = config?.actors[message.actorId];
+    if (config === undefined || provenance === undefined || message.chatId !== config.roomId) {
+      throw new Error("Fleet gate answer source is not authorized by the server profile");
+    }
+    return provenance;
+  }
+
   private async handleChannelExit(active: ActiveChannel, diagnostic?: string): Promise<void> {
-    if (this.activeChannels.get(active.profile) !== active) return;
-    this.activeChannels.delete(active.profile);
+    if (this.activeChannels.get(active.channelId) !== active) return;
+    this.activeChannels.delete(active.channelId);
     this.markApplyingChannelEffectsAmbiguous(active.resourceId, "adapter_exited_without_receipt", [
       ...active.inFlight,
     ]);
     if (diagnostic !== undefined) this.log(`channel ${active.profile} exited: ${diagnostic}`);
-    if (
-      active.stopping ||
-      this.stopping ||
-      this.decisionChannelConfig?.telegramProfiles?.[active.profile] === undefined
-    ) {
+    if (active.stopping || this.stopping || !this.isChannelConfigured(active.channelId)) {
       return;
     }
     const replacement: ChannelAdapterLaunch = {
@@ -2954,14 +3034,14 @@ export class WorkflowServer {
   }
 
   private async handleChannelMessage(
-    profile: string,
+    channelId: string,
     message: ChannelAdapterMessage,
   ): Promise<ChannelAdapterResponse> {
-    const active = this.activeChannels.get(profile);
+    const active = this.activeChannels.get(channelId);
     if (
       active === undefined ||
       active.launch.adapterEpoch !== message.adapterEpoch ||
-      message.profile !== profile
+      message.profile !== active.profile
     ) {
       return channelResponse(message, "rejected", 0, null, "Channel adapter epoch is stale");
     }
@@ -3052,14 +3132,7 @@ export class WorkflowServer {
     }
 
     this.saveChannelCursor(active.channelId, message.cursor);
-    const config = this.decisionChannelConfig?.telegramProfiles?.[active.profile];
-    if (
-      config === undefined ||
-      !config.allowedUserIds.includes(message.actorId) ||
-      !config.allowedChatIds.includes(message.chatId)
-    ) {
-      throw new Error("Telegram answer source is not authorized by the server profile");
-    }
+    const provenance = this.channelAnswerProvenance(active, message);
     const interaction = this.serverState.listPendingDecisionInteractions().find((candidate) => {
       const request = candidate.contract as unknown as HumanDecisionRequest;
       return request.decisionId === message.decisionId;
@@ -3067,7 +3140,13 @@ export class WorkflowServer {
     if (interaction === undefined) return;
     const request = interaction.contract as unknown as HumanDecisionRequest;
     if (request.requestDigest !== message.requestDigest) {
-      throw new Error("Telegram answer request digest is stale");
+      throw new Error(`${active.adapterType} answer request digest is stale`);
+    }
+    if (
+      provenance === "delegate" &&
+      this.decisionChannelConfig?.audiences[request.audience]?.delegates !== true
+    ) {
+      throw new Error("Fleet gate delegate answer is not permitted for this audience");
     }
     const afterCommit: Array<() => void> = [];
     const result = this.state.transaction(() =>
@@ -3081,6 +3160,7 @@ export class WorkflowServer {
           eventId: message.eventId,
         },
         idempotencyKey: message.idempotencyKey,
+        provenance,
         submissionId: message.stableMessageId,
         expectedRevision: interaction.revision,
         afterCommit,
@@ -3091,7 +3171,7 @@ export class WorkflowServer {
       result.outcome !== "adopted" &&
       result.outcome !== "conflict"
     ) {
-      throw new Error(result.error ?? "Telegram answer was rejected");
+      throw new Error(result.error ?? `${active.adapterType} answer was rejected`);
     }
     for (const effect of afterCommit) setImmediate(effect);
   }
@@ -3162,7 +3242,7 @@ export class WorkflowServer {
       };
     }
 
-    const pollRequests: HumanDecisionChannelRequest[] = [];
+    const pollRequests: ChannelPollRequest[] = [];
     for (const interaction of interactions) {
       const request = interaction.contract as unknown as HumanDecisionRequest;
       if (
@@ -3172,7 +3252,14 @@ export class WorkflowServer {
       }
       const deliveries = await this.decisions.listDeliveries(request.decisionId, active.channelId);
       if (deliveries.some(isConfirmedChannelDelivery)) {
-        pollRequests.push(humanDecisionChannelRequest(request));
+        pollRequests.push({
+          ...humanDecisionChannelRequest(request),
+          messages: this.confirmedChannelMessageReferences(
+            request.decisionId,
+            request.requestDigest,
+            active.channelId,
+          ),
+        });
       }
     }
     return {

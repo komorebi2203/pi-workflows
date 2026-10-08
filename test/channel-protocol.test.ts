@@ -198,7 +198,7 @@ describe("channel adapter protocol", () => {
         response: { choice: "continue" },
         messages: [reference],
       },
-      { kind: "channel.poll", cursor: 4, requests: [request()] },
+      { kind: "channel.poll", cursor: 4, requests: [{ ...request(), messages: [reference] }] },
     ];
     for (const command of commands) {
       expect(
@@ -282,6 +282,7 @@ describe("channel adapter protocol", () => {
   it("validates the private launch envelope and helper output", () => {
     const launch = {
       schema: "pi-workflows.channel-adapter-launch.v1",
+      adapterType: "telegram",
       adapterEpoch: "adapter-1",
       profile: "approval",
       token: "private-token",
@@ -293,6 +294,7 @@ describe("channel adapter protocol", () => {
     expect(() =>
       parseChannelAdapterLaunch({
         schema: "pi-workflows.channel-adapter-launch.v1",
+        adapterType: "telegram",
         adapterEpoch: "adapter-1",
         profile: "approval",
         allowedUserIds: ["100"],
@@ -303,6 +305,25 @@ describe("channel adapter protocol", () => {
     expect(() => parseChannelAdapterLaunch({ ...launch, allowedUserIds: [] })).toThrow(
       "allowedUserIds is invalid",
     );
+    expect(
+      parseChannelAdapterLaunch({
+        schema: "pi-workflows.channel-adapter-launch.v1",
+        adapterType: "fleet-gate",
+        adapterEpoch: "adapter-1",
+        profile: "dobby",
+        token: "private-token",
+        psiRoot: "/tmp/psi",
+        fleetCoreDir: "/tmp/fleet-core",
+        dobbyCharter: "/tmp/dobby.yaml",
+        roomId: "1516161412873982136",
+        actors: {
+          "fleet:dobby": "delegate",
+          "discord:722419769147654221": "human",
+        },
+        pickupMs: 1000,
+        answerMs: 2000,
+      }),
+    ).toMatchObject({ adapterType: "fleet-gate", profile: "dobby" });
 
     const ready = parseChannelAdapterMessage(
       frame({

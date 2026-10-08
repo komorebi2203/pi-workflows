@@ -93,6 +93,7 @@ export class TelegramAdapter {
     outcome: "accepted" | "cancelled" | "expired",
     response: HumanDecisionResponse | undefined,
     messages: readonly TelegramMessageReference[],
+    _request?: HumanDecisionChannelRequest,
   ): Promise<void> {
     const seenChats = new Set<string>();
     for (const message of messages) {
