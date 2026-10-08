@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { digestCanonical } from "../workflows/decision-presentation.js";
@@ -11,11 +11,15 @@ import {
 import { renderDecisionText } from "./telegram.js";
 
 const DEFAULT_DISCORD_API_BASE = "https://discord.com/api/v10";
+const DEFAULT_GATE_ANSWER_DIR = "/root/hello-oracle/ψ/inbox/piw-gate-answers";
 const DOBBY_ACTOR = "fleet:dobby";
 const DOBBY_MEMBER = "dobby";
-const YIM_ACTOR = "discord:722419769147654221";
 const YIM_DISCORD_USER = "722419769147654221";
-const CHOICE_EMOJIS = ["✅", "🛑", "🔁", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"];
+const CHOICE_TEXT_MARKERS = ["✅", "🛑", "🔁", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"] as const;
+const DISCORD_ACTION_ROW_LIMIT = 5;
+const DISCORD_BUTTONS_PER_ROW_LIMIT = 5;
+const DISCORD_BUTTON_LABEL_LIMIT = 80;
+const DISCORD_BUTTON_CUSTOM_ID_LIMIT = 100;
 
 type FleetTaskModule = {
   createTask: (psiRoot: string, task: Record<string, unknown>) => Promise<unknown> | unknown;
@@ -52,9 +56,20 @@ type GateState = {
   rules: Map<number, "green" | "yellow" | "red">;
   status: "open" | "escalated" | "answered" | "settled";
   cardId?: string;
-  noticePosted?: boolean;
   lateVerdictLogged?: boolean;
   settlementErrorCode?: string;
+};
+
+type GateAnswerFile = {
+  schema: "piw-gate-answer.v1";
+  gateId: string;
+  choiceIndex: number;
+  userId: string;
+  messageId: string;
+  channelId: string;
+  interactionId: string;
+  at: string;
+  sig: string;
 };
 
 export class FleetGateAdapter {
@@ -71,11 +86,14 @@ export class FleetGateAdapter {
       fleetCoreDir: string;
       dobbyCharter: string;
       roomId: string;
+      actors: Record<string, "human" | "delegate">;
       pickupMs: number;
       answerMs: number;
       fleetTasks: FleetTaskModule;
       fetchFn?: FleetGateFetch;
       apiBase?: string;
+      answerDir?: string;
+      hmacKey?: string;
       logFn?: (message: string) => void;
     },
   ) {
@@ -95,6 +113,7 @@ export class FleetGateAdapter {
       fleetCoreDir: launch.fleetCoreDir,
       dobbyCharter: launch.dobbyCharter,
       roomId: launch.roomId,
+      actors: launch.actors,
       pickupMs: launch.pickupMs,
       answerMs: launch.answerMs,
       fleetTasks: "createTask" in fleetTasks ? fleetTasks : (fleetTasks.default as FleetTaskModule),
@@ -298,52 +317,32 @@ export class FleetGateAdapter {
     cursor: number,
   ): Promise<FleetGateVerifiedAnswer | undefined> {
     if (gate.cardId === undefined) return undefined;
+    const answer = await this.readGateAnswer(gate);
+    if (answer === undefined) return undefined;
     const choices = Object.keys(gate.request.choices);
-    const selected: string[] = [];
-    for (const [index, choice] of choices.entries()) {
-      const emoji = CHOICE_EMOJIS[index];
-      if (emoji === undefined) throw new Error("Fleet gate choice emoji is not configured");
-      const users = await this.discord(
-        "GET",
-        `/channels/${this.options.roomId}/messages/${gate.cardId}/reactions/${encodeURIComponent(
-          emoji,
-        )}`,
-      );
-      if (asArray(users).some((user) => textField(user, "id") === YIM_DISCORD_USER)) {
-        selected.push(choice);
-      }
-    }
-    if (selected.length === 0) return undefined;
-    if (selected.length > 1) {
-      if (gate.noticePosted !== true) {
-        gate.noticePosted = true;
-        await this.discord("POST", `/channels/${this.options.roomId}/messages`, {
-          content: `${this.cardMarker(gate.gateId)}\n<@${YIM_DISCORD_USER}> pick exactly one reaction.`,
-        });
-      }
+    const choice = choices[answer.choiceIndex];
+    if (choice === undefined) {
+      this.log(`fleet-gate ignored invalid answer for ${gate.gateId}: choiceIndex out of range`);
       return undefined;
     }
-    const choice = selected[0] as string;
+    const actorId = `discord:${answer.userId}`;
+    if (this.options.actors[actorId] !== "human") {
+      this.log(`fleet-gate ignored invalid answer for ${gate.gateId}: user is not a human actor`);
+      return undefined;
+    }
     const definition = gate.request.choices[choice];
     if (definition?.input !== undefined) {
-      if (gate.noticePosted !== true) {
-        gate.noticePosted = true;
-        await this.discord("POST", `/channels/${this.options.roomId}/messages`, {
-          content: `${this.cardMarker(gate.gateId)}\n<@${YIM_DISCORD_USER}> ${choice} requires text input: ${definition.input.prompt}`,
-        });
-      }
+      this.log(`fleet-gate ignored invalid answer for ${gate.gateId}: choice requires text input`);
       return undefined;
     }
-    const selectedEmoji = CHOICE_EMOJIS[choices.indexOf(choice)];
-    if (selectedEmoji === undefined) throw new Error("Fleet gate choice emoji is not configured");
     gate.status = "answered";
     return {
       request: gate.request,
       response: { choice },
-      actorId: YIM_ACTOR,
+      actorId,
       chatId: this.options.roomId,
-      eventId: `${gate.cardId}:${selectedEmoji}`,
-      idempotencyKey: `fleet-gate:dobby:discord:${gate.cardId}:${choice}`,
+      eventId: answer.interactionId,
+      idempotencyKey: `fleet-gate:dobby:discord:${answer.interactionId}`,
       cursor,
     };
   }
@@ -369,28 +368,18 @@ export class FleetGateAdapter {
     const choices = Object.entries(gate.request.choices);
     const choiceText = choices
       .map(([choice, definition], index) => {
-        const emoji = CHOICE_EMOJIS[index];
-        if (emoji === undefined) throw new Error("Fleet gate choice emoji is not configured");
-        return `${emoji} ${choice}: ${definition.label}`;
+        return `${CHOICE_TEXT_MARKERS[index] ?? `${index + 1}.`} ${choice}: ${definition.label}`;
       })
       .join("\n");
+    const components = buttonComponents(gate.gateId, choices);
     const posted = await this.discord("POST", `/channels/${this.options.roomId}/messages`, {
       content: `${this.cardMarker(gate.gateId)}\n<@${YIM_DISCORD_USER}>\n${renderDecisionText(
         gate.request,
       )}\n\nDobby reason (AI):\n${reason}\n\n${choiceText}`,
+      components,
     });
     const cardId = textField(posted, "id");
     if (cardId === undefined) throw new Error("Discord card response did not include an id");
-    for (const [index] of choices.entries()) {
-      const emoji = CHOICE_EMOJIS[index];
-      if (emoji === undefined) throw new Error("Fleet gate choice emoji is not configured");
-      await this.discord(
-        "PUT",
-        `/channels/${this.options.roomId}/messages/${cardId}/reactions/${encodeURIComponent(
-          emoji,
-        )}/@me`,
-      );
-    }
     return cardId;
   }
 
@@ -451,6 +440,67 @@ export class FleetGateAdapter {
       return;
     }
     process.stderr.write(`${message}\n`);
+  }
+
+  private async readGateAnswer(gate: GateState): Promise<
+    | {
+        choiceIndex: number;
+        userId: string;
+        interactionId: string;
+      }
+    | undefined
+  > {
+    if (gate.cardId === undefined) return undefined;
+    const file = path.join(
+      this.options.answerDir ?? DEFAULT_GATE_ANSWER_DIR,
+      `${gate.gateId}.json`,
+    );
+    let raw: string;
+    try {
+      raw = await fs.readFile(file, "utf8");
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") return undefined;
+      this.log(`fleet-gate ignored invalid answer for ${gate.gateId}: cannot read answer file`);
+      return undefined;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      this.log(`fleet-gate ignored invalid answer for ${gate.gateId}: answer file is not JSON`);
+      return undefined;
+    }
+    const answer = parseGateAnswer(parsed);
+    if (answer === undefined) {
+      this.log(`fleet-gate ignored invalid answer for ${gate.gateId}: answer schema is invalid`);
+      return undefined;
+    }
+    if (answer.gateId !== gate.gateId) {
+      this.log(`fleet-gate ignored invalid answer for ${gate.gateId}: gateId mismatch`);
+      return undefined;
+    }
+    if (answer.messageId !== gate.cardId) {
+      this.log(`fleet-gate ignored invalid answer for ${gate.gateId}: messageId mismatch`);
+      return undefined;
+    }
+    if (answer.channelId !== this.options.roomId) {
+      this.log(`fleet-gate ignored invalid answer for ${gate.gateId}: channelId mismatch`);
+      return undefined;
+    }
+    const hmacKey = this.options.hmacKey ?? process.env.ORACLE_FLEET_HMAC_KEY;
+    if (hmacKey === undefined || hmacKey.length === 0) {
+      this.log(`fleet-gate ignored invalid answer for ${gate.gateId}: HMAC key is unavailable`);
+      return undefined;
+    }
+    if (!verifyGateAnswerSignature(answer, hmacKey)) {
+      this.log(`fleet-gate ignored invalid answer for ${gate.gateId}: signature mismatch`);
+      return undefined;
+    }
+    return {
+      choiceIndex: answer.choiceIndex,
+      userId: answer.userId,
+      interactionId: answer.interactionId,
+    };
   }
 
   private async discord(method: string, route: string, body?: unknown): Promise<unknown> {
@@ -535,18 +585,115 @@ function renderTaskBody(
   ].join("\n\n");
 }
 
+function buttonComponents(
+  gateId: string,
+  choices: Array<[string, HumanDecisionChannelRequest["choices"][string]]>,
+): Array<{
+  type: 1;
+  components: Array<{ type: 2; style: 2; label: string; custom_id: string }>;
+}> {
+  const capacity = DISCORD_ACTION_ROW_LIMIT * DISCORD_BUTTONS_PER_ROW_LIMIT;
+  if (choices.length > capacity) {
+    throw new Error(`Fleet gate choices exceed Discord button capacity (${capacity})`);
+  }
+  const rows: Array<{
+    type: 1;
+    components: Array<{ type: 2; style: 2; label: string; custom_id: string }>;
+  }> = [];
+  for (const [index, [, definition]] of choices.entries()) {
+    const customId = `piwgate:v1:${gateId}:${index}`;
+    if (customId.length > DISCORD_BUTTON_CUSTOM_ID_LIMIT) {
+      throw new Error("Fleet gate button custom_id exceeds Discord limit");
+    }
+    if (definition.label.length === 0 || definition.label.length > DISCORD_BUTTON_LABEL_LIMIT) {
+      throw new Error("Fleet gate button label exceeds Discord limit");
+    }
+    const rowIndex = Math.floor(index / DISCORD_BUTTONS_PER_ROW_LIMIT);
+    let row = rows[rowIndex];
+    if (row === undefined) {
+      row = { type: 1, components: [] };
+      rows[rowIndex] = row;
+    }
+    row.components.push({
+      type: 2,
+      style: 2,
+      label: definition.label,
+      custom_id: customId,
+    });
+  }
+  return rows;
+}
+
+function parseGateAnswer(value: unknown): GateAnswerFile | undefined {
+  const answer = asRecord(value);
+  if (
+    answer?.schema !== "piw-gate-answer.v1" ||
+    !Number.isSafeInteger(answer.choiceIndex) ||
+    (answer.choiceIndex as number) < 0 ||
+    typeof answer.gateId !== "string" ||
+    typeof answer.userId !== "string" ||
+    typeof answer.messageId !== "string" ||
+    typeof answer.channelId !== "string" ||
+    typeof answer.interactionId !== "string" ||
+    typeof answer.at !== "string" ||
+    typeof answer.sig !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(answer.sig)
+  ) {
+    return undefined;
+  }
+  return {
+    schema: "piw-gate-answer.v1",
+    gateId: answer.gateId,
+    choiceIndex: answer.choiceIndex as number,
+    userId: answer.userId,
+    messageId: answer.messageId,
+    channelId: answer.channelId,
+    interactionId: answer.interactionId,
+    at: answer.at,
+    sig: answer.sig,
+  };
+}
+
+function verifyGateAnswerSignature(answer: GateAnswerFile, hmacKey: string): boolean {
+  const signedPayload = JSON.stringify([
+    answer.schema,
+    answer.gateId,
+    answer.choiceIndex,
+    answer.userId,
+    answer.messageId,
+    answer.channelId,
+    answer.interactionId,
+    answer.at,
+  ]);
+  const expected = createHmac("sha256", hmacKey).update(signedPayload).digest("hex");
+  const actualBuffer = Buffer.from(answer.sig, "hex");
+  const expectedBuffer = Buffer.from(expected, "hex");
+  return (
+    actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer)
+  );
+}
+
+// Parses the gate_policy block of Dobby's charter as it is actually written (fleet/dobby.yaml): the tier
+// emoji sits on a SECTION HEADER line and the rules below it are plain "N. ..." lines. The first version
+// required number and emoji on the same line, matched nothing in the real charter, and threw on every
+// gate (found live 2026-10-08: pilot run stuck, delivery effect ambiguous). Only the gate_policy block is
+// read, because the rest of the charter also uses 🟩🟨🟥 for other things.
 function parseRuleTable(charter: string): Map<number, "green" | "yellow" | "red"> {
   const rules = new Map<number, "green" | "yellow" | "red">();
-  for (const line of charter.split(/\r?\n/u)) {
-    const number = line.match(/(?:^|[^0-9])([1-9]|1[0-6])(?:[^0-9]|$)/u)?.[1];
-    const emoji = line.includes("🟩")
-      ? "green"
-      : line.includes("🟨")
-        ? "yellow"
-        : line.includes("🟥")
-          ? "red"
-          : undefined;
-    if (number !== undefined && emoji !== undefined) rules.set(Number(number), emoji);
+  const lines = charter.split(/\r?\n/u);
+  const start = lines.findIndex((line) => /^\s*gate_policy:\s*\|/u.test(line));
+  if (start < 0) throw new Error("Dobby charter has no gate_policy block");
+  const indent = (lines[start]?.match(/^\s*/u)?.[0].length ?? 0) + 1;
+  let tier: "green" | "yellow" | "red" | undefined;
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() !== "" && (line.match(/^\s*/u)?.[0].length ?? 0) < indent) break;
+    const header = /^\s*(🟩|🟨|🟥)/u.exec(line)?.[1];
+    if (header !== undefined) {
+      tier = header === "🟩" ? "green" : header === "🟨" ? "yellow" : "red";
+      continue;
+    }
+    const number = /^\s*([1-9]|1[0-6])\.\s/u.exec(line)?.[1];
+    if (number !== undefined && tier !== undefined) rules.set(Number(number), tier);
   }
   for (let rule = 1; rule <= 16; rule += 1) {
     const expected = rule <= 6 ? "green" : rule <= 9 ? "yellow" : "red";
@@ -554,6 +701,8 @@ function parseRuleTable(charter: string): Map<number, "green" | "yellow" | "red"
   }
   return rules;
 }
+
+export { parseRuleTable as parseRuleTableForTest };
 
 function parseVerdict(
   summary: string | undefined,
@@ -598,6 +747,10 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+function isNodeError(value: unknown): value is NodeJS.ErrnoException {
+  return value instanceof Error && "code" in value;
 }
 
 function escapeRegExp(value: string): string {

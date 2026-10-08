@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -12,14 +13,23 @@ import {
 import { decisionPrompt, makeTempDir } from "../helpers.js";
 
 const ROOM = "1516161412873982136";
-const BOT = "1520338692429058209";
+const HUMAN_USER = "722419769147654221";
+const HMAC_KEY = "test-hmac-key";
 
+// Same shape as the real fleet/dobby.yaml gate_policy block: the tier emoji is on a section header and
+// the rules under it are plain "N. ..." lines (see fleet-gate-charter.test.ts for the verbatim snapshot).
 function charter(): string {
-  return Array.from({ length: 16 }, (_, index) => {
-    const rule = index + 1;
-    const tier = rule <= 6 ? "🟩" : rule <= 9 ? "🟨" : "🟥";
-    return `${tier} ${rule}. Rule ${rule}`;
-  }).join("\n");
+  const rule = (n: number) => `    ${n}. Rule ${n}`;
+  return [
+    "charter:",
+    "  gate_policy: |",
+    "    🟩 green header:",
+    ...[1, 2, 3, 4, 5, 6].map(rule),
+    "    🟨 yellow header:",
+    ...[7, 8, 9].map(rule),
+    "    🟥 red header:",
+    ...[10, 11, 12, 13, 14, 15, 16].map(rule),
+  ].join("\n");
 }
 
 function request(text = "Apply the safe change.") {
@@ -87,6 +97,7 @@ async function fixture() {
   const created: Record<string, unknown>[] = [];
   const withdrawn: string[] = [];
   const logs: string[] = [];
+  const answerDir = path.join(dir, "piw-gate-answers");
   const fleetTasks = {
     createTask(_psiRoot: string, task: Record<string, unknown>) {
       created.push(task);
@@ -112,14 +123,29 @@ async function fixture() {
       fleetCoreDir: dir,
       dobbyCharter: charterPath,
       roomId: ROOM,
+      actors: {
+        "discord:722419769147654221": "human",
+        "fleet:dobby": "delegate",
+      },
       pickupMs: 5,
       answerMs: 5,
       fleetTasks,
       fetchFn: discord.fetchFn,
       apiBase: "https://discord.invalid",
+      answerDir,
+      hmacKey: HMAC_KEY,
       logFn: (message) => logs.push(message),
     });
-  return { adapter: createAdapter(), createAdapter, tasks, created, withdrawn, discord, logs };
+  return {
+    adapter: createAdapter(),
+    createAdapter,
+    tasks,
+    created,
+    withdrawn,
+    discord,
+    logs,
+    answerDir,
+  };
 }
 
 describe("fleet gate adapter", () => {
@@ -138,7 +164,7 @@ describe("fleet gate adapter", () => {
       deliver_channel: ROOM,
     });
     expect(created[0]).not.toHaveProperty("subject");
-    expect(String(created[0]?.body)).toContain("🟥 16. Rule 16");
+    expect(String(created[0]?.body)).toContain("16. Rule 16");
     expect(String(created[0]?.body)).toContain("PIW-GATE v1");
   });
 
@@ -208,7 +234,7 @@ describe("fleet gate adapter", () => {
     ]);
   });
 
-  it("bot pre-reactions + user 999 reaction -> no answer after 3 polls", async () => {
+  it("posts Discord buttons without reaction pre-reacts", async () => {
     const { adapter, tasks, discord } = await fixture();
     const value = request();
     adapter.setRequests([value]);
@@ -219,12 +245,136 @@ describe("fleet gate adapter", () => {
       source_member: "dobby",
       summary: `PIW-GATE v1 ${gateId} continue rule=11`,
     });
-    for (let index = 0; index < 3; index += 1) {
-      discord.react("✅", BOT);
-      discord.react("✅", "999");
-      expect((await adapter.poll(index)).answers).toEqual([]);
-    }
-    expect(discord.calls.some((call) => call.method === "POST")).toBe(true);
+    expect((await adapter.poll(0)).answers).toEqual([]);
+    expect(discord.calls.some((call) => call.method === "PUT")).toBe(false);
+    const post = discord.calls.find((call) => call.method === "POST");
+    expect(post?.body).toMatchObject({
+      components: [
+        {
+          type: 1,
+          components: [
+            {
+              type: 2,
+              style: 2,
+              label: "Continue",
+              custom_id: `piwgate:v1:${gateId}:0`,
+            },
+            {
+              type: 2,
+              style: 2,
+              label: "Stop",
+              custom_id: `piwgate:v1:${gateId}:1`,
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("ignores forged fleet gate answer files with bad signatures", async () => {
+    const { adapter, tasks, discord, answerDir, logs } = await fixture();
+    const value = request();
+    adapter.setRequests([value]);
+    await adapter.present(value);
+    const gateId = await escalateWithRedDobbyVerdict(adapter, tasks);
+    await writeAnswerFile(answerDir, {
+      gateId,
+      choiceIndex: 0,
+      userId: HUMAN_USER,
+      messageId: discord.latestMessageId(),
+      channelId: ROOM,
+      interactionId: "interaction-bad-sig",
+      signKey: "wrong-key",
+    });
+
+    expect((await adapter.poll(0)).answers).toEqual([]);
+    expect(logs.some((line) => line.includes("signature mismatch"))).toBe(true);
+  });
+
+  it("ignores signed answer files for another Discord card", async () => {
+    const { adapter, tasks, discord, answerDir, logs } = await fixture();
+    const value = request();
+    adapter.setRequests([value]);
+    await adapter.present(value);
+    const gateId = await escalateWithRedDobbyVerdict(adapter, tasks);
+    await writeAnswerFile(answerDir, {
+      gateId,
+      choiceIndex: 0,
+      userId: HUMAN_USER,
+      messageId: "card-other",
+      channelId: ROOM,
+      interactionId: "interaction-wrong-message",
+    });
+
+    expect((await adapter.poll(0)).answers).toEqual([]);
+    expect(logs.some((line) => line.includes("messageId mismatch"))).toBe(true);
+    expect(discord.latestMessageId()).toBe("card-1");
+  });
+
+  it("ignores signed answer files from non-human profile actors", async () => {
+    const { adapter, tasks, discord, answerDir, logs } = await fixture();
+    const value = request();
+    adapter.setRequests([value]);
+    await adapter.present(value);
+    const gateId = await escalateWithRedDobbyVerdict(adapter, tasks);
+    await writeAnswerFile(answerDir, {
+      gateId,
+      choiceIndex: 0,
+      userId: "999",
+      messageId: discord.latestMessageId(),
+      channelId: ROOM,
+      interactionId: "interaction-wrong-user",
+    });
+
+    expect((await adapter.poll(0)).answers).toEqual([]);
+    expect(logs.some((line) => line.includes("user is not a human actor"))).toBe(true);
+  });
+
+  it("ignores signed answer files with a stale gateId", async () => {
+    const { adapter, tasks, discord, answerDir, logs } = await fixture();
+    const value = request();
+    adapter.setRequests([value]);
+    await adapter.present(value);
+    const gateId = await escalateWithRedDobbyVerdict(adapter, tasks);
+    await writeAnswerFile(answerDir, {
+      gateId,
+      payloadGateId: "oldgate",
+      choiceIndex: 0,
+      userId: HUMAN_USER,
+      messageId: discord.latestMessageId(),
+      channelId: ROOM,
+      interactionId: "interaction-stale-gate",
+    });
+
+    expect((await adapter.poll(0)).answers).toEqual([]);
+    expect(logs.some((line) => line.includes("gateId mismatch"))).toBe(true);
+  });
+
+  it("accepts a valid signed button answer with human provenance", async () => {
+    const { adapter, tasks, discord, answerDir } = await fixture();
+    const value = request();
+    adapter.setRequests([value]);
+    await adapter.present(value);
+    const gateId = await escalateWithRedDobbyVerdict(adapter, tasks);
+    await writeAnswerFile(answerDir, {
+      gateId,
+      choiceIndex: 0,
+      userId: HUMAN_USER,
+      messageId: discord.latestMessageId(),
+      channelId: ROOM,
+      interactionId: "interaction-valid",
+    });
+
+    expect((await adapter.poll(12)).answers).toEqual([
+      expect.objectContaining({
+        response: { choice: "continue" },
+        actorId: `discord:${HUMAN_USER}`,
+        chatId: ROOM,
+        eventId: "interaction-valid",
+        idempotencyKey: "fleet-gate:dobby:discord:interaction-valid",
+        cursor: 13,
+      }),
+    ]);
   });
 
   it("verdict with previous gateId -> discarded, escalated", async () => {
@@ -354,14 +504,13 @@ describe("fleet gate adapter", () => {
 function fakeDiscord() {
   const calls: Array<{ method: string; route: string; body: unknown }> = [];
   const messages: Array<{ id: string; content: string }> = [];
-  const reactions = new Map<string, Set<string>>();
   let nextMessage = 1;
   return {
     calls,
-    react(emoji: string, userId: string) {
-      const users = reactions.get(emoji) ?? new Set<string>();
-      users.add(userId);
-      reactions.set(emoji, users);
+    latestMessageId() {
+      const id = messages[0]?.id;
+      if (id === undefined) throw new Error("no Discord message posted");
+      return id;
     },
     fetchFn: async (url: string, init?: RequestInit) => {
       const route = new URL(url).pathname + new URL(url).search;
@@ -375,10 +524,6 @@ function fakeDiscord() {
         nextMessage += 1;
         messages.unshift(message);
         result = message;
-      }
-      if (method === "GET" && route.includes("/reactions/")) {
-        const emoji = decodeURIComponent(route.split("/reactions/")[1] ?? "");
-        result = [...(reactions.get(emoji) ?? new Set<string>())].map((id) => ({ id }));
       }
       return {
         ok: true,
@@ -396,4 +541,62 @@ function gateIdFromTask(task: Record<string, unknown> | undefined): string {
   const match = body.match(/PIW-GATE v1 ([0-9a-f]{16})/u);
   if (match === null) throw new Error("gate id missing");
   return match[1] as string;
+}
+
+async function escalateWithRedDobbyVerdict(
+  adapter: FleetGateAdapter,
+  tasks: Map<string, Record<string, unknown>>,
+): Promise<string> {
+  const gateId = gateIdFromTask(tasks.get("task-1"));
+  tasks.set("task-1", {
+    status: "done",
+    source_member: "dobby",
+    summary: `PIW-GATE v1 ${gateId} continue rule=11`,
+  });
+  expect((await adapter.poll(0)).answers).toEqual([]);
+  return gateId;
+}
+
+async function writeAnswerFile(
+  answerDir: string,
+  options: {
+    gateId: string;
+    payloadGateId?: string;
+    choiceIndex: number;
+    userId: string;
+    messageId: string;
+    channelId: string;
+    interactionId: string;
+    signKey?: string;
+  },
+): Promise<void> {
+  await fs.mkdir(answerDir, { recursive: true });
+  const answer = {
+    schema: "piw-gate-answer.v1",
+    gateId: options.payloadGateId ?? options.gateId,
+    choiceIndex: options.choiceIndex,
+    userId: options.userId,
+    messageId: options.messageId,
+    channelId: options.channelId,
+    interactionId: options.interactionId,
+    at: "2026-10-08T00:00:00.000Z",
+  };
+  const sig = createHmac("sha256", options.signKey ?? HMAC_KEY)
+    .update(
+      JSON.stringify([
+        answer.schema,
+        answer.gateId,
+        answer.choiceIndex,
+        answer.userId,
+        answer.messageId,
+        answer.channelId,
+        answer.interactionId,
+        answer.at,
+      ]),
+    )
+    .digest("hex");
+  await fs.writeFile(
+    path.join(answerDir, `${options.gateId}.json`),
+    JSON.stringify({ ...answer, sig }),
+  );
 }
