@@ -125,6 +125,26 @@ describe("WorkflowClient", () => {
     }
   });
 
+  it("writes detached server output to a private log beside the database", async () => {
+    const directory = await makeTempDir("client-server-log");
+    const databasePath = path.join(directory, "state.sqlite");
+    const serverEntryPath = path.join(directory, "logging-server.mjs");
+    await fs.writeFile(
+      serverEntryPath,
+      'import fs from "node:fs"; console.log("server stdout"); console.error("server stderr"); fs.writeSync(3, "startup stopped\\n"); process.exit(1);',
+    );
+    const client = new WorkflowClient({ databasePath, serverEntryPath });
+    try {
+      await (client as unknown as { startDetached: () => Promise<Error> }).startDetached();
+      const logPath = path.join(directory, "server.log");
+      expect(await fs.readFile(logPath, "utf8")).toContain("server stdout");
+      expect(await fs.readFile(logPath, "utf8")).toContain("server stderr");
+      expect((await fs.stat(logPath)).mode & 0o777).toBe(0o600);
+    } finally {
+      await client.close();
+    }
+  });
+
   it("prefers the detached server error when startup never becomes available", async () => {
     const databasePath = path.join(await makeTempDir("client-startup-blocker"), "state.sqlite");
     const client = new WorkflowClient({ databasePath });

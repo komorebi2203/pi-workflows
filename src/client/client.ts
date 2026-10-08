@@ -4,6 +4,7 @@ import { once } from "node:events";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import net, { type Socket } from "node:net";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { workflowStatePath } from "../state/database.js";
 import { canonicalJson, parseJson, type JsonValue } from "../state/json.js";
@@ -30,6 +31,7 @@ import type { WorkflowRunListPage, WorkflowRunSummary, WorkflowRunView } from ".
 const CONNECT_TIMEOUT_MS = 2_000;
 const START_TIMEOUT_MS = 10_000;
 const STARTUP_STDERR_LIMIT_BYTES = 64 * 1024;
+const SERVER_LOG_ROTATE_BYTES = 10 * 1024 * 1024;
 /** Capped exponential reconnect delay with jitter; the first retry is fastest. */
 const RECONNECT_BASE_DELAY_MS = 250;
 const RECONNECT_MAX_DELAY_MS = 10_000;
@@ -921,11 +923,22 @@ export class WorkflowClient {
       this.serverEntryPath === undefined && !fs.existsSync(builtEntry)
         ? ["--import", createRequire(import.meta.url).resolve("tsx"), sourceEntry]
         : [entry];
-    const child = spawn(process.execPath, [...args, "--database", this.databasePath], {
-      detached: true,
-      stdio: ["ignore", "ignore", "ignore", "pipe"],
-      env: { ...process.env, ...this.env, PI_WORKFLOWS_STARTUP_FD: "3" },
-    });
+    const log = openServerLog(this.databasePath);
+    let child;
+    try {
+      child = spawn(process.execPath, [...args, "--database", this.databasePath], {
+        detached: true,
+        stdio: ["ignore", log.fd ?? "ignore", log.fd ?? "ignore", "pipe"],
+        env: {
+          ...process.env,
+          ...this.env,
+          PI_WORKFLOWS_STARTUP_FD: "3",
+          ...(log.warning === undefined ? {} : { PI_WORKFLOWS_STARTUP_LOG_WARNING: log.warning }),
+        },
+      });
+    } finally {
+      if (log.fd !== undefined) fs.closeSync(log.fd);
+    }
     const startupDiagnostic = child.stdio[3];
     if (startupDiagnostic === null || startupDiagnostic === undefined) {
       child.unref();
@@ -964,6 +977,28 @@ export class WorkflowClient {
     });
     child.unref();
     return failure;
+  }
+}
+
+function openServerLog(databasePath: string): { fd?: number; warning?: string } {
+  const logPath = path.join(path.dirname(databasePath), "server.log");
+  try {
+    try {
+      if (fs.statSync(logPath).size > SERVER_LOG_ROTATE_BYTES) {
+        const previousPath = `${logPath}.1`;
+        fs.rmSync(previousPath, { force: true });
+        fs.renameSync(logPath, previousPath);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const fd = fs.openSync(logPath, "a", 0o600);
+    fs.fchmodSync(fd, 0o600);
+    return { fd };
+  } catch (error) {
+    return {
+      warning: `Workflow server log is unavailable; continuing without file logging: ${toError(error).message}`,
+    };
   }
 }
 

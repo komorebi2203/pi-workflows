@@ -5,6 +5,14 @@ import { WorkflowServer } from "./server.js";
 
 async function main(): Promise<void> {
   const startupFd = process.env.PI_WORKFLOWS_STARTUP_FD === "3" ? 3 : undefined;
+  const logWarning = process.env.PI_WORKFLOWS_STARTUP_LOG_WARNING;
+  if (startupFd !== undefined && logWarning !== undefined) {
+    try {
+      fs.writeSync(startupFd, `${logWarning}\n`);
+    } catch {
+      // The parent may have exited before startup began.
+    }
+  }
   const closeStartupChannel = (): void => {
     if (startupFd === undefined) return;
     try {
