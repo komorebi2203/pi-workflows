@@ -103,6 +103,7 @@ export class FleetGateAdapter {
   static async fromLaunch(
     launch: Extract<ChannelAdapterLaunch, { adapterType: "fleet-gate" }>,
   ): Promise<FleetGateAdapter> {
+    if (launch.hmacKey !== undefined) process.env.ORACLE_FLEET_HMAC_KEY = launch.hmacKey;
     const fleetTasks = (await import(path.join(launch.fleetCoreDir, "fleet-tasks.mjs"))) as
       | FleetTaskModule
       | { default?: FleetTaskModule };
@@ -117,6 +118,7 @@ export class FleetGateAdapter {
       pickupMs: launch.pickupMs,
       answerMs: launch.answerMs,
       fleetTasks: "createTask" in fleetTasks ? fleetTasks : (fleetTasks.default as FleetTaskModule),
+      ...(launch.hmacKey === undefined ? {} : { hmacKey: launch.hmacKey }),
       ...(launch.apiBase === undefined ? {} : { apiBase: launch.apiBase }),
     });
   }

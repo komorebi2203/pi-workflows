@@ -22,6 +22,7 @@ export type DecisionChannelConfig = {
     string,
     {
       credential: string;
+      hmacCredential?: string;
       psiRoot: string;
       fleetCoreDir: string;
       dobbyCharter: string;
@@ -80,6 +81,11 @@ export async function loadDecisionChannelConfig(
       type: "fleet-gate" as const,
       credential: profile.credential,
     })),
+    ...Object.values(channels.fleetGateProfiles ?? {}).flatMap((profile) =>
+      profile.hmacCredential === undefined
+        ? []
+        : [{ type: "fleet-gate" as const, credential: profile.hmacCredential }],
+    ),
   ];
   const credentialTypes = new Map<string, (typeof profiles)[number]["type"]>();
   for (const profile of profiles) {
@@ -254,6 +260,10 @@ export function parseChannelConfig(value: unknown): DecisionChannelConfig {
         profile.credential,
         `Fleet gate profile ${name} credential`,
       );
+      const hmacCredential =
+        profile.hmacCredential === undefined
+          ? undefined
+          : requireSimpleId(profile.hmacCredential, `Fleet gate profile ${name} hmacCredential`);
       const psiRoot = requireAbsolutePath(profile.psiRoot, `Fleet gate profile ${name} psiRoot`);
       const fleetCoreDir = requireAbsolutePath(
         profile.fleetCoreDir,
@@ -277,6 +287,7 @@ export function parseChannelConfig(value: unknown): DecisionChannelConfig {
       );
       fleetGateProfiles[name] = {
         credential,
+        ...(hmacCredential === undefined ? {} : { hmacCredential }),
         psiRoot,
         fleetCoreDir,
         dobbyCharter,

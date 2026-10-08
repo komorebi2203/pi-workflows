@@ -322,8 +322,13 @@ describe("channel adapter protocol", () => {
         },
         pickupMs: 1000,
         answerMs: 2000,
+        hmacKey: "private-hmac-key",
       }),
-    ).toMatchObject({ adapterType: "fleet-gate", profile: "dobby" });
+    ).toMatchObject({
+      adapterType: "fleet-gate",
+      profile: "dobby",
+      hmacKey: "private-hmac-key",
+    });
 
     const ready = parseChannelAdapterMessage(
       frame({

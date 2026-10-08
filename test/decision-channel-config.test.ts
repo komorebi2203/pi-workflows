@@ -350,6 +350,50 @@ describe("decision channel configuration", () => {
     expect(loaded?.channels.fleetGateProfiles?.dobby?.actors["fleet:dobby"]).toBe("delegate");
   });
 
+  it("loads a fleet gate HMAC credential for the adapter launch", async () => {
+    const configDir = await makeTempDir("decision-fleet-gate-hmac");
+    const tokenFile = path.join(configDir, "discord.env");
+    const hmacFile = path.join(configDir, "hmac.env");
+    await fs.writeFile(tokenFile, "DISCORD_TOKEN=fixture-discord-token\n", { mode: 0o600 });
+    await fs.writeFile(hmacFile, "ORACLE_FLEET_HMAC_KEY=fixture-hmac-key\n", { mode: 0o600 });
+    await privateJson(path.join(configDir, "channels.json"), fleetGateConfig("fleet-hmac"));
+    await privateJson(path.join(configDir, "credentials.json"), {
+      schema: "pi-workflows.credentials.v1",
+      fleetGate: {
+        dobby: { envFile: tokenFile, variable: "DISCORD_TOKEN" },
+        "fleet-hmac": { envFile: hmacFile, variable: "ORACLE_FLEET_HMAC_KEY" },
+      },
+    });
+
+    const loaded = await loadDecisionChannelConfig(configDir);
+    expect(loaded?.channels.fleetGateProfiles?.dobby?.hmacCredential).toBe("fleet-hmac");
+    expect(loaded?.credentials["fleet-hmac"]).toBe("fixture-hmac-key");
+  });
+
+  it.each([
+    ["missing file", "missing", 0o600, "ORACLE_FLEET_HMAC_KEY=secret-never-report\n"],
+    ["public file", "present", 0o644, "ORACLE_FLEET_HMAC_KEY=secret-never-report\n"],
+    ["missing variable", "present", 0o600, "OTHER=secret-never-report\n"],
+  ])("fails closed for a fleet gate HMAC credential with a %s", async (_case, file, mode, body) => {
+    const configDir = await makeTempDir("decision-fleet-gate-hmac-invalid");
+    const tokenFile = path.join(configDir, "discord.env");
+    const hmacFile = path.join(configDir, "hmac.env");
+    await fs.writeFile(tokenFile, "DISCORD_TOKEN=fixture-discord-token\n", { mode: 0o600 });
+    if (file === "present") await fs.writeFile(hmacFile, body, { mode });
+    await privateJson(path.join(configDir, "channels.json"), fleetGateConfig("fleet-hmac"));
+    await privateJson(path.join(configDir, "credentials.json"), {
+      schema: "pi-workflows.credentials.v1",
+      fleetGate: {
+        dobby: { envFile: tokenFile, variable: "DISCORD_TOKEN" },
+        "fleet-hmac": { envFile: hmacFile, variable: "ORACLE_FLEET_HMAC_KEY" },
+      },
+    });
+
+    const error = await loadDecisionChannelConfig(configDir).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).not.toContain("secret-never-report");
+  });
+
   it("rejects a credential id reused across Telegram and fleet gate profiles", async () => {
     const configDir = await makeTempDir("decision-credential-cross-type");
     const tokenFile = path.join(configDir, "telegram-token");
@@ -426,6 +470,32 @@ describe("decision channel configuration", () => {
     ).rejects.toThrow(/absolute/);
   });
 });
+
+function fleetGateConfig(hmacCredential: string) {
+  return {
+    schema: "pi-workflows.channels.v1",
+    audiences: {
+      operator: {
+        channels: ["fleet-gate:dobby"],
+        accept: "first-valid-answer",
+        delegates: true,
+      },
+    },
+    fleetGateProfiles: {
+      dobby: {
+        credential: "dobby",
+        hmacCredential,
+        psiRoot: "/tmp/psi",
+        fleetCoreDir: "/tmp/fleet-core",
+        dobbyCharter: "/tmp/dobby.yaml",
+        roomId: "1516161412873982136",
+        actors: { "fleet:dobby": "delegate" },
+        pickupMs: 1000,
+        answerMs: 2000,
+      },
+    },
+  };
+}
 
 function neverResponse() {
   return {

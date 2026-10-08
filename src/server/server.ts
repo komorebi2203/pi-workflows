@@ -2884,6 +2884,13 @@ export class WorkflowServer {
         const token = loaded.credentials[config.credential];
         if (token === undefined)
           throw new Error(`Fleet gate credential ${config.credential} is missing`);
+        const hmacKey =
+          config.hmacCredential === undefined
+            ? undefined
+            : loaded.credentials[config.hmacCredential];
+        if (config.hmacCredential !== undefined && hmacKey === undefined) {
+          throw new Error(`Fleet gate credential ${config.hmacCredential} is missing`);
+        }
         await this.startDecisionChannel({
           schema: "pi-workflows.channel-adapter-launch.v1",
           adapterType: "fleet-gate",
@@ -2897,6 +2904,7 @@ export class WorkflowServer {
           actors: config.actors,
           pickupMs: config.pickupMs,
           answerMs: config.answerMs,
+          ...(hmacKey === undefined ? {} : { hmacKey }),
           ...(this.options.env?.PI_WORKFLOWS_DISCORD_API_BASE === undefined
             ? {}
             : { apiBase: this.options.env.PI_WORKFLOWS_DISCORD_API_BASE }),
@@ -2924,7 +2932,7 @@ export class WorkflowServer {
       ...(this.options.channelAdapterEntryPath === undefined
         ? {}
         : { adapterEntryPath: this.options.channelAdapterEntryPath }),
-      onDiagnostic: (message) => this.log(`channel ${launch.profile}: ${message}`),
+      onDiagnostic: (message) => this.log(`[adapter ${launch.profile}] ${message}`),
     });
     const active: ActiveChannel = {
       profile: launch.profile,

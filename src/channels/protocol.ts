@@ -118,6 +118,7 @@ export type ChannelAdapterLaunch = {
       actors: Record<string, "human" | "delegate">;
       pickupMs: number;
       answerMs: number;
+      hmacKey?: string;
     }
 );
 
@@ -199,6 +200,7 @@ export function parseChannelAdapterLaunch(value: unknown): ChannelAdapterLaunch 
     validateActors(launch.actors);
     requirePositiveInteger(launch.pickupMs, "pickupMs");
     requirePositiveInteger(launch.answerMs, "answerMs");
+    requireOptionalText(launch.hmacKey, "hmacKey");
   }
   return launch as ChannelAdapterLaunch;
 }

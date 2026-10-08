@@ -16,6 +16,39 @@ const ROOM = "1516161412873982136";
 const HUMAN_USER = "722419769147654221";
 const HMAC_KEY = "test-hmac-key";
 
+it("carries a launch HMAC key into the adapter and fleet task environment", async () => {
+  const fleetCoreDir = await makeTempDir("fleet-gate-launch");
+  await fs.writeFile(
+    path.join(fleetCoreDir, "fleet-tasks.mjs"),
+    "export function createTask() { return { task_id: 'unused' }; }\n",
+  );
+  const prior = process.env.ORACLE_FLEET_HMAC_KEY;
+  try {
+    const adapter = await FleetGateAdapter.fromLaunch({
+      schema: "pi-workflows.channel-adapter-launch.v1",
+      adapterType: "fleet-gate",
+      adapterEpoch: "adapter-1",
+      profile: "dobby",
+      token: "discord-token",
+      hmacKey: HMAC_KEY,
+      psiRoot: "/tmp/psi",
+      fleetCoreDir,
+      dobbyCharter: "/tmp/dobby.yaml",
+      roomId: ROOM,
+      actors: { "fleet:dobby": "delegate" },
+      pickupMs: 1000,
+      answerMs: 2000,
+    });
+    expect((adapter as unknown as { options: { hmacKey?: string } }).options.hmacKey).toBe(
+      HMAC_KEY,
+    );
+    expect(process.env.ORACLE_FLEET_HMAC_KEY).toBe(HMAC_KEY);
+  } finally {
+    if (prior === undefined) delete process.env.ORACLE_FLEET_HMAC_KEY;
+    else process.env.ORACLE_FLEET_HMAC_KEY = prior;
+  }
+});
+
 // Same shape as the real fleet/dobby.yaml gate_policy block: the tier emoji is on a section header and
 // the rules under it are plain "N. ..." lines (see fleet-gate-charter.test.ts for the verbatim snapshot).
 function charter(): string {
