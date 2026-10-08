@@ -167,6 +167,7 @@ async function fixture() {
       apiBase: "https://discord.invalid",
       answerDir,
       hmacKey: HMAC_KEY,
+      idlePollMs: 0,
       logFn: (message) => logs.push(message),
     });
   return {
@@ -182,6 +183,28 @@ async function fixture() {
 }
 
 describe("fleet gate adapter", () => {
+  it("paces an empty poll instead of returning at once", async () => {
+    // Guards the 2026-10-08 hot loop: an instant empty poll made adapter-entry report
+    // channel.ready ~128 times a second, each journaled as an event (5.8M rows, 4.9 GB).
+    const adapter = new FleetGateAdapter({
+      profile: "dobby",
+      token: "fixture-token",
+      psiRoot: "/nonexistent",
+      fleetCoreDir: "/nonexistent",
+      dobbyCharter: "/nonexistent",
+      roomId: "1",
+      actors: {},
+      pickupMs: 5,
+      answerMs: 5,
+      fleetTasks: { createTask: () => ({}) },
+      idlePollMs: 60,
+    });
+    const started = Date.now();
+    const result = await adapter.poll(7);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(55);
+    expect(result).toEqual({ cursor: 7, answers: [] });
+  });
+
   it("presents one signed Dobby task with the charter and verdict grammar", async () => {
     const { adapter, created } = await fixture();
     const value = request();

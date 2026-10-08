@@ -94,6 +94,8 @@ export class FleetGateAdapter {
       apiBase?: string;
       answerDir?: string;
       hmacKey?: string;
+      /** Wait this long before an empty poll returns (default 2000). */
+      idlePollMs?: number;
       logFn?: (message: string) => void;
     },
   ) {
@@ -195,6 +197,14 @@ export class FleetGateAdapter {
           answers.push(answer);
         }
       }
+    }
+    // Pace an empty poll. adapter-entry re-polls as soon as poll() returns, and the server journals
+    // every channel.ready report as an event + blob. Telegram's poll waits on the network; this one
+    // returned at once, so the pair spun at ~128 reports/s and grew state.sqlite to 4.9 GB in
+    // ~10 h (measured 2026-10-08: 5.8M channel.ready events, server at 60-100% CPU, hello timeouts).
+    const idleMs = this.options.idlePollMs ?? 2000;
+    if (answers.length === 0 && idleMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, idleMs));
     }
     return { cursor: nextCursor, answers };
   }
