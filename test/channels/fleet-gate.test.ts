@@ -207,6 +207,48 @@ describe("fleet gate adapter", () => {
     ]);
   });
 
+  it("accepts the single verdict line when Dobby writes it LAST (live pilot shape, 2026-10-08)", async () => {
+    const { adapter, tasks } = await fixture();
+    const value = request();
+    adapter.setRequests([value]);
+    await adapter.present(value);
+    const gateId = gateIdFromTask(tasks.get("task-1"));
+    tasks.set("task-1", {
+      status: "done",
+      source_member: "dobby",
+      summary: `Reasoning first.\n- reversible, scratch repo\n\nPIW-GATE v1 ${gateId} continue rule=5`,
+    });
+    const polled = await adapter.poll(0);
+    expect(polled.answers).toEqual([
+      expect.objectContaining({ response: { choice: "continue" }, actorId: "fleet:dobby" }),
+    ]);
+  });
+
+  it("escalates when the reply carries two verdict lines (ambiguous)", async () => {
+    const { adapter, tasks } = await fixture();
+    const value = request();
+    adapter.setRequests([value]);
+    await adapter.present(value);
+    const gateId = gateIdFromTask(tasks.get("task-1"));
+    tasks.set("task-1", {
+      status: "done",
+      source_member: "dobby",
+      summary: `PIW-GATE v1 ${gateId} continue rule=5\nPIW-GATE v1 ${gateId} stop rule=5`,
+    });
+    const polled = await adapter.poll(0);
+    expect(polled.answers).toEqual([]);
+  });
+
+  it("sends Dobby only the gate_policy block and the facts-only instruction", async () => {
+    const { adapter, tasks } = await fixture();
+    const value = request();
+    await adapter.present(value);
+    const body = String(tasks.get("task-1")?.body);
+    expect(body).toContain("16. Rule 16");
+    expect(body).not.toContain("charter:");
+    expect(body).toContain("Judge ONLY from the facts written in this request");
+  });
+
   it("rehydrates a restarted adapter from verified delivery messages before accepting Dobby", async () => {
     const { adapter, createAdapter, tasks } = await fixture();
     const value = request();

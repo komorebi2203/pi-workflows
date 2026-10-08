@@ -570,6 +570,21 @@ function pollRequestParts(value: HumanDecisionChannelRequest | ChannelPollReques
   };
 }
 
+// Only the gate_policy block travels to Dobby: the rest of the charter is persona/voice text that has
+// nothing to do with the decision and made the task ~30KB.
+function gatePolicyBlock(charter: string): string {
+  const lines = charter.split(/\r?\n/u);
+  const start = lines.findIndex((line) => /^\s*gate_policy:\s*\|/u.test(line));
+  if (start < 0) throw new Error("Dobby charter has no gate_policy block");
+  const indent = (lines[start]?.match(/^\s*/u)?.[0].length ?? 0) + 1;
+  const out: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() !== "" && (line.match(/^\s*/u)?.[0].length ?? 0) < indent) break;
+    out.push(line.trim());
+  }
+  return out.join("\n").trim();
+}
+
 function renderTaskBody(
   request: HumanDecisionChannelRequest,
   gateId: string,
@@ -578,9 +593,14 @@ function renderTaskBody(
   const choices = Object.keys(request.choices).join("|");
   return [
     renderDecisionText(request),
-    "Dobby gate rules:",
-    charter.trim(),
-    "Verdict grammar:",
+    "Dobby gate rules (from your charter, gate_policy):",
+    gatePolicyBlock(charter),
+    "How to answer:",
+    [
+      "- Judge ONLY from the facts written in this request. Do not assume a repository, branch,",
+      "  commit or test result that is not stated here; if a fact you need is missing, answer escalate.",
+      "- Put the verdict on its own line, exactly once, in this form:",
+    ].join("\n"),
     `PIW-GATE v1 ${gateId} <${choices}|escalate> rule=<1-16>`,
   ].join("\n\n");
 }
@@ -709,10 +729,11 @@ function parseVerdict(
   gate: GateState,
 ): { choice: string; rule: number } | undefined {
   if (summary === undefined) return undefined;
-  const lines = summary.split(/\r?\n/u);
+  // Exactly one verdict-shaped line anywhere in the reply (live 2026-10-08: Dobby wrote prose first and
+  // the verdict last). Two or more is ambiguous and escalates; position no longer matters.
   const matches = summary.match(/^PIW-GATE v1 \S+ \S+ rule=(?:[1-9]|1[0-6])$/gmu) ?? [];
   if (matches.length !== 1) return undefined;
-  const match = lines[0]?.match(
+  const match = matches[0]?.match(
     new RegExp(
       `^PIW-GATE v1 ${escapeRegExp(gate.gateId)} ([A-Za-z_][A-Za-z0-9_-]*|escalate) rule=([1-9]|1[0-6])$`,
       "u",
