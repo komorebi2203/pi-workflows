@@ -349,9 +349,11 @@ export class FleetGateAdapter {
 
   private async escalate(gate: GateState, reason: string): Promise<void> {
     if (gate.status === "escalated") return;
-    gate.status = "escalated";
+    // Mark escalated only after a card exists: a failed post must be retried on the next poll, not
+    // leave the gate silently "escalated" with no card (live 2026-10-08).
     const existing = await this.findCard(gate.gateId);
     gate.cardId = existing ?? (await this.postCard(gate, reason));
+    gate.status = "escalated";
   }
 
   private async findCard(gateId: string): Promise<string | undefined> {
@@ -373,9 +375,12 @@ export class FleetGateAdapter {
       .join("\n");
     const components = buttonComponents(gate.gateId, choices);
     const posted = await this.discord("POST", `/channels/${this.options.roomId}/messages`, {
-      content: `${this.cardMarker(gate.gateId)}\n<@${YIM_DISCORD_USER}>\n${renderDecisionText(
-        gate.request,
-      )}\n\nDobby reason (AI):\n${reason}\n\n${choiceText}`,
+      content: fitCardContent(
+        `${this.cardMarker(gate.gateId)}\n<@${YIM_DISCORD_USER}>`,
+        renderDecisionText(gate.request),
+        reason,
+        choiceText,
+      ),
       components,
     });
     const cardId = textField(posted, "id");
@@ -603,6 +608,30 @@ function renderTaskBody(
     ].join("\n"),
     `PIW-GATE v1 ${gateId} <${choices}|escalate> rule=<1-16>`,
   ].join("\n\n");
+}
+
+// Discord rejects message content over 2000 chars. The head (marker + mention) and the choice list must
+// always survive; the request text and Dobby's reason are shortened, reason first.
+const DISCORD_CONTENT_LIMIT = 2000;
+export function fitCardContent(
+  head: string,
+  request: string,
+  reason: string,
+  choices: string,
+): string {
+  const reasonLabel = "Dobby reason (AI, shortened if long; full text is Dobby's message above):";
+  const build = (req: string, why: string) =>
+    `${head}\n${req}\n\n${reasonLabel}\n${why}\n\n${choices}`;
+  const cut = (text: string, max: number) =>
+    text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
+  if (build(request, reason).length <= DISCORD_CONTENT_LIMIT) return build(request, reason);
+  const fixed = build("", "").length;
+  const room = DISCORD_CONTENT_LIMIT - fixed;
+  const reqBudget = Math.min(request.length, Math.max(200, Math.floor(room * 0.6)));
+  const req = cut(request, reqBudget);
+  const why = cut(reason, Math.max(0, room - req.length));
+  const out = build(req, why);
+  return out.length <= DISCORD_CONTENT_LIMIT ? out : out.slice(0, DISCORD_CONTENT_LIMIT);
 }
 
 function buttonComponents(

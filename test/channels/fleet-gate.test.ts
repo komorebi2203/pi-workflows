@@ -249,6 +249,44 @@ describe("fleet gate adapter", () => {
     expect(body).toContain("Judge ONLY from the facts written in this request");
   });
 
+  it("posts a card within Discord's limit when Dobby's escalation reason is long (live round 3)", async () => {
+    const { adapter, tasks, discord } = await fixture();
+    const value = request("R".repeat(1500));
+    adapter.setRequests([value]);
+    await adapter.present(value);
+    const gateId = gateIdFromTask(tasks.get("task-1"));
+    tasks.set("task-1", {
+      status: "done",
+      source_member: "dobby",
+      summary: `${"เหตุผลยาว ".repeat(160)}\n\nPIW-GATE v1 ${gateId} escalate rule=11`,
+    });
+    await adapter.poll(0);
+    const card = discord.calls.find((c) => c.method === "POST" && c.route.endsWith("/messages"));
+    const content = String((card?.body as { content?: string })?.content);
+    expect(content.length).toBeLessThanOrEqual(2000);
+    expect(content).toContain(`PIW-GATE-CARD ${gateId}`);
+    expect(content).toContain("<@722419769147654221>");
+    expect(content).toContain("continue");
+    expect(discord.latestMessageId()).toBe("card-1");
+  });
+
+  it("retries the escalation card on the next poll after a failed post", async () => {
+    const { adapter, tasks, discord } = await fixture();
+    const value = request();
+    adapter.setRequests([value]);
+    await adapter.present(value);
+    const gateId = gateIdFromTask(tasks.get("task-1"));
+    tasks.set("task-1", {
+      status: "done",
+      source_member: "dobby",
+      summary: `PIW-GATE v1 ${gateId} escalate rule=11`,
+    });
+    discord.control.failNextPost = true;
+    await adapter.poll(0).catch(() => undefined);
+    await adapter.poll(0);
+    expect(discord.latestMessageId()).toBe("card-1");
+  });
+
   it("rehydrates a restarted adapter from verified delivery messages before accepting Dobby", async () => {
     const { adapter, createAdapter, tasks } = await fixture();
     const value = request();
@@ -547,8 +585,10 @@ function fakeDiscord() {
   const calls: Array<{ method: string; route: string; body: unknown }> = [];
   const messages: Array<{ id: string; content: string }> = [];
   let nextMessage = 1;
+  const control = { failNextPost: false };
   return {
     calls,
+    control,
     latestMessageId() {
       const id = messages[0]?.id;
       if (id === undefined) throw new Error("no Discord message posted");
@@ -562,6 +602,17 @@ function fakeDiscord() {
       let result: unknown = {};
       if (method === "GET" && route.endsWith("/messages?limit=50")) result = messages;
       if (method === "POST" && route.endsWith("/messages")) {
+        // Real Discord: content over 2000 chars is a 400 (live 2026-10-08 round 3).
+        if (control.failNextPost || String(body.content).length > 2000) {
+          control.failNextPost = false;
+          return {
+            ok: false,
+            status: 400,
+            async json() {
+              return { code: 50035, message: "Invalid Form Body" };
+            },
+          };
+        }
         const message = { id: `card-${nextMessage}`, content: String(body.content) };
         nextMessage += 1;
         messages.unshift(message);
