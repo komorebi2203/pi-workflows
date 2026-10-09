@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* istanbul ignore file -- live gate verification requires repository-scoped GitHub auth */
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 

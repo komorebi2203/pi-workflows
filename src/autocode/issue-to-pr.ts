@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* istanbul ignore file -- live orchestration requires three external subscription logins */
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
