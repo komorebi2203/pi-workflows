@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { CliStepExecutor } from "../server/cli-executor.js";
 import { agent, compute, defineWorkflow } from "../workflows/definition.js";
 import { WorkflowEngine } from "../workflows/engine.js";
+import { waitForCi } from "./ci-wait.js";
 
 const REPO = "komorebi2203/autocode-sandbox";
 const ROOT = "/srv/piw";
@@ -18,6 +19,7 @@ type Input = {
   runId: string;
   worktree: string;
   branch: string;
+  taskTitle?: string;
 };
 type Route = {
   route: "continue" | "retry" | "blocked" | "failed";
@@ -287,7 +289,7 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
             ["reset", "--", ".piw-issue.json", ".piw-plan.md", ".piw-verify.log"],
             value.worktree,
           );
-          const taskRef = value.linearIdentifier ?? `issue ${value.issue}`;
+          const taskRef = value.linearIdentifier ?? (value.issue ? `issue ${value.issue}` : "task");
           run("git", ["commit", "-m", `feat: resolve ${taskRef}`], value.worktree);
           run("git", ["push", "-u", "origin", value.branch], value.worktree);
           const url = run(
@@ -302,11 +304,13 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
               "--base",
               "main",
               "--title",
-              `feat: resolve ${taskRef}`,
+              value.taskTitle ?? `feat: resolve ${taskRef}`,
               "--body",
               value.linearIdentifier
                 ? `Linear: ${value.linearIdentifier}`
-                : `Closes #${value.issue}`,
+                : value.issue
+                  ? `Closes #${value.issue}`
+                  : "Linear: none",
             ],
             value.worktree,
           );
@@ -323,14 +327,11 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
       }),
       gate: compute({
         statusDetail: "waiting for CI and writing the gate",
-        run: ({ input, outputs }) => {
+        run: async ({ input, outputs }) => {
           const value = input as Input;
           const pr = outputs.pr as { number: number; headRefOid: string; url: string };
-          run(
-            "gh",
-            ["pr", "checks", String(pr.number), "-R", REPO, "--watch", "--fail-fast"],
-            value.worktree,
-          );
+          const ci = await waitForCi(REPO, pr.headRefOid);
+          if (!ci.green) throw new Error(ci.reason);
           const current = JSON.parse(
             run(
               "gh",
@@ -406,6 +407,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const issue = at >= 0 ? Number(argv[at + 1]) : undefined;
   const taskFile = tf >= 0 ? argv[tf + 1] : undefined;
   let linearIdentifier: string | undefined;
+  let taskTitle: string | undefined;
   if (taskFile) {
     const task = JSON.parse(readFileSync(taskFile, "utf8")) as {
       identifier?: unknown;
@@ -413,13 +415,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       body?: unknown;
     };
     if (
-      typeof task.identifier !== "string" ||
-      !/^[A-Z][A-Z0-9]+-\d+$/u.test(task.identifier) ||
+      (task.identifier !== undefined &&
+        (typeof task.identifier !== "string" || !/^[A-Z][A-Z0-9]+-\d+$/u.test(task.identifier))) ||
       typeof task.title !== "string" ||
       typeof task.body !== "string"
     )
       usage();
-    linearIdentifier = task.identifier;
+    linearIdentifier = task.identifier as string | undefined;
+    taskTitle = task.title;
   }
   const generatedRunId = `${new Date()
     .toISOString()
@@ -432,9 +435,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     ...(issue === undefined ? {} : { issue }),
     ...(taskFile === undefined ? {} : { taskFile }),
     ...(linearIdentifier === undefined ? {} : { linearIdentifier }),
+    ...(taskTitle === undefined ? {} : { taskTitle }),
     runId,
     worktree: `${ROOT}/work/${runId}`,
-    branch: `autocode/${linearIdentifier ?? issue}-${runId}`,
+    branch: `autocode/${linearIdentifier ?? issue ?? "task"}-${runId}`,
   };
   let revision = 0;
   let latestState: RunEventState = "running";
@@ -496,9 +500,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     else
       emit({
         state: "failed",
-        reason: /Resource not accessible by personal access token.*statusCheckRollup/su.test(reason)
-          ? "checks permission"
-          : reason,
+        reason,
       });
     console.log(
       JSON.stringify(

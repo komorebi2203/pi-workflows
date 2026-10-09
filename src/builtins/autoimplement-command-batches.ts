@@ -159,7 +159,12 @@ export function parseCiInspectionBatch(value: unknown): CiInspectionBatch {
       ),
     };
     if (raw.route === "pending") {
-      target.trackingCommand = parseCiCommand(raw.trackingCommand, id, repository, pr);
+      target.trackingCommand = parseCiCommand(
+        raw.trackingCommand,
+        id,
+        repository,
+        target.headRevision,
+      );
     }
     return target;
   });
@@ -183,33 +188,19 @@ export function parseCiCommand(
   value: unknown,
   id: string,
   repository: string,
-  pr: string,
+  headRevision: string,
 ): CommandBatchItem {
   const raw = requireRecord(value, "CI tracking command");
   if (raw.id !== id) throw new Error("CI tracking command id must match the target repository");
   const command = parseCommandItem(raw, "CI tracking command", {
     id,
-    command: "gh",
+    command: "piw-ci-wait",
     cwd: repository,
     maxTimeoutMs: CI_WATCH_TIMEOUT_MS,
   });
-  const args = command.args;
-  const prWatch =
-    (args.length === 3 && args[0] === "pr" && args[1] === "checks" && args[2] === "--watch") ||
-    (args.length === 4 &&
-      args[0] === "pr" &&
-      args[1] === "checks" &&
-      args[2] === pr &&
-      args[3] === "--watch");
-  const runWatch =
-    args.length === 3 &&
-    args[0] === "run" &&
-    args[1] === "watch" &&
-    /^[1-9]\d*$/.test(args[2] ?? "");
-  if (!prWatch && !runWatch) {
-    throw new Error("CI tracking command args are not allowed for the target PR");
-  }
-  return { ...command, args: ["pr", "checks", pr, "--watch"] };
+  if (command.args.length !== 2 || command.args[1] !== headRevision)
+    throw new Error("CI tracking command must use the exact target head revision");
+  return { ...command, args: [command.args[0] ?? "", headRevision] };
 }
 
 export function repositoryId(repository: string): string {

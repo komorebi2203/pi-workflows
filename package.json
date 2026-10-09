@@ -17,6 +17,7 @@
   "bin": {
     "issue-to-pr": "dist/autocode/issue-to-pr.js",
     "pi-workflows": "dist/viewer/cli.js",
+    "piw-ci-wait": "dist/autocode/ci-wait.js",
     "piw-gate-check": "dist/autocode/gate-check.js",
     "piw-merge": "dist/autocode/merge.js"
   },

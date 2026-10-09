@@ -137,8 +137,8 @@ function ciInspection(
           ? {
               trackingCommand: {
                 id: repositoryId(repository),
-                command: "gh",
-                args: ["pr", "checks", "--watch"],
+                command: "piw-ci-wait",
+                args: ["owner/repository", headRevision],
                 cwd: repository,
                 timeoutMs: 300_000,
                 maxOutputChars: 1_000_000,

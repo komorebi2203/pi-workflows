@@ -140,8 +140,8 @@ describe("autoimplement command batch contracts", () => {
           unrelatedFailures: [],
           trackingCommand: {
             id,
-            command: "gh",
-            args: ["pr", "checks", "--watch"],
+            command: "piw-ci-wait",
+            args: ["owner/repository", "abc123"],
             cwd: repository,
             timeoutMs: 300_000,
             maxOutputChars: 100_000,
@@ -155,7 +155,7 @@ describe("autoimplement command batch contracts", () => {
         {
           id,
           route: "pending",
-          trackingCommand: { args: ["pr", "checks", pr, "--watch"] },
+          trackingCommand: { args: ["owner/repository", "abc123"] },
         },
       ],
     });
@@ -221,21 +221,14 @@ describe("autoimplement command batch contracts", () => {
     ).toThrow(/route is invalid/);
     const command = {
       id,
-      command: "gh",
-      args: ["pr", "checks", "--watch"],
+      command: "piw-ci-wait",
+      args: ["owner/repository", "abc123"],
       cwd: repository,
       timeoutMs: 300_000,
       maxOutputChars: 100_000,
     };
-    expect(
-      parseCiCommand({ ...command, args: ["run", "watch", "123"] }, id, repository, pr),
-    ).toMatchObject({
-      args: ["pr", "checks", pr, "--watch"],
-    });
-    expect(
-      parseCiCommand({ ...command, args: ["pr", "checks", pr, "--watch"] }, id, repository, pr),
-    ).toMatchObject({
-      args: ["pr", "checks", pr, "--watch"],
+    expect(parseCiCommand(command, id, repository, "abc123")).toMatchObject({
+      args: ["owner/repository", "abc123"],
     });
     for (const invalid of [
       { ...command, id: "wrong" },
@@ -244,12 +237,10 @@ describe("autoimplement command batch contracts", () => {
       { ...command, cwd: path.join(repository, "other") },
       { ...command, timeoutMs: 0 },
       { ...command, maxOutputChars: 0 },
-      { ...command, args: ["pr", "merge"] },
-      { ...command, args: ["pr", "checks", "https://example.test/pr/2", "--watch"] },
-      { ...command, args: ["pr", "checks", pr, "--watch", "--repo", "other/repo"] },
-      { ...command, args: ["run", "watch", "123", "--repo", "other/repo"] },
+      { ...command, args: ["owner/repository", "wrong-head"] },
+      { ...command, args: ["owner/repository", "abc123", "extra"] },
     ]) {
-      expect(() => parseCiCommand(invalid, id, repository, pr)).toThrow();
+      expect(() => parseCiCommand(invalid, id, repository, "abc123")).toThrow();
     }
   });
 });
