@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* istanbul ignore file -- the CLI reads live GitHub Actions and commit-status APIs */
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
