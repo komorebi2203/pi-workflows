@@ -80,9 +80,7 @@ export class RpcStepExecutor implements AgentStepExecutor {
   async runAgentStep(request: AgentStepRequest, signal: AbortSignal): Promise<AgentStepSubmission> {
     await this.ensureStarted();
     if (request.model !== undefined) {
-      this.child?.stdin?.write(
-        `${JSON.stringify({ type: "set_model", ...request.model })}\n`,
-      );
+      this.child?.stdin?.write(`${JSON.stringify({ type: "set_model", ...request.model })}\n`);
     }
     let prompt = request.prompt;
     for (;;) {
