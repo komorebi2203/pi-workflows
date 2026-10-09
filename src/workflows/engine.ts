@@ -1352,6 +1352,15 @@ export class WorkflowEngine {
         contract,
         prompt,
         ...(node.model === undefined ? {} : { model: { ...node.model } }),
+        ...(node.executor === undefined ? {} : { executor: node.executor }),
+        ...(node.cli === undefined
+          ? {}
+          : {
+              cli: {
+                command: node.cli.command,
+                ...(node.cli.args === undefined ? {} : { args: [...node.cli.args] }),
+              },
+            }),
         ...(state.runTitle !== undefined || node.statusDetail !== undefined
           ? {
               presentation: {
