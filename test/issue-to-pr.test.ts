@@ -3,7 +3,16 @@ import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { changedAssertions, createIssueToPrWorkflow } from "../src/autocode/issue-to-pr.js";
+import {
+  blockedOutcome,
+  changedAssertions,
+  createIssueToPrWorkflow,
+  settledWorkflowStatus,
+  treeFingerprint,
+} from "../src/autocode/issue-to-pr.js";
+import { compute, defineWorkflow } from "../src/workflows/definition.js";
+import { WorkflowEngine } from "../src/workflows/engine.js";
+import { makeStateDatabasePath, ScriptedExecutor } from "./helpers.js";
 
 function git(cwd: string, args: string[]): void {
   execFileSync("git", args, { cwd });
@@ -18,13 +27,44 @@ describe("issue-to-pr workflow", () => {
       from: "verify",
       switch: {
         on: "$.route",
-        cases: { continue: "review", retry: "implement", blocked: "blocked" },
+        cases: { continue: "beforeReview", retry: "implement", blocked: "blocked" },
       },
     });
     expect(workflow.edges).toContainEqual({
       from: "guard",
       switch: { on: "$.route", cases: { continue: "pr", blocked: "blocked" } },
     });
+  });
+
+  it("settles a blocked run with a reason and JSON-safe output", async () => {
+    const workflow = defineWorkflow({
+      name: "issue-to-pr-blocked-test",
+      startAt: "route",
+      nodes: {
+        route: compute({ run: () => ({ route: "blocked", reason: "verify" }) }),
+        blocked: compute({ run: ({ outputs }) => blockedOutcome({ verify: outputs.route }) }),
+      },
+      edges: [{ from: "route", switch: { on: "$.route", cases: { blocked: "blocked" } } }],
+    });
+    const result = await new WorkflowEngine({
+      executor: new ScriptedExecutor(),
+      databasePath: await makeStateDatabasePath("issue-to-pr-blocked"),
+    }).run(workflow, {});
+    expect(result.state.finalOutput).toEqual({ status: "blocked", reason: "verify" });
+    expect(settledWorkflowStatus(result.state.status, result.state.finalOutput)).toBe("blocked");
+  });
+
+  it("detects a review-time worktree modification", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "issue-to-pr-review-tree-"));
+    git(cwd, ["init", "-b", "main"]);
+    git(cwd, ["config", "user.email", "test@example.invalid"]);
+    git(cwd, ["config", "user.name", "Test"]);
+    writeFileSync(join(cwd, "tracked.txt"), "before\n");
+    git(cwd, ["add", "."]);
+    git(cwd, ["commit", "-m", "base"]);
+    const before = treeFingerprint(cwd);
+    writeFileSync(join(cwd, "decoy.txt"), "written during review\n");
+    expect(treeFingerprint(cwd)).not.toEqual(before);
   });
 
   it("detects a changed existing assertion but permits a new test", () => {

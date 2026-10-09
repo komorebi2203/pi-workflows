@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* istanbul ignore file -- live orchestration requires three external subscription logins */
 import { execFileSync, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,7 +12,12 @@ import { WorkflowEngine } from "../workflows/engine.js";
 const REPO = "komorebi2203/autocode-sandbox";
 const ROOT = "/srv/piw";
 type Input = { issue: number; runId: string; worktree: string; branch: string };
-type Route = { route: "continue" | "retry" | "blocked"; reason?: string; detail?: string };
+type Route = {
+  route: "continue" | "retry" | "blocked" | "failed";
+  reason?: string;
+  detail?: string;
+};
+type TreeFingerprint = { status: string; diffHash: string };
 
 function run(command: string, args: string[], cwd?: string): string {
   return execFileSync(command, args, {
@@ -74,6 +79,30 @@ export function changedAssertions(worktree: string): string[] {
       found.push(file);
   }
   return [...new Set(found)];
+}
+
+export function treeFingerprint(worktree: string): TreeFingerprint {
+  const status = run("git", ["status", "--porcelain"], worktree);
+  const diff = run("git", ["diff", "--binary", "HEAD"], worktree);
+  return { status, diffHash: createHash("sha256").update(diff).digest("hex") };
+}
+
+export function blockedOutcome(outputs: Record<string, unknown>) {
+  const candidates = [outputs.guard, outputs.assessReview, outputs.verify] as Route[];
+  const blocked = candidates.find((item) => item?.route === "blocked");
+  return {
+    status: "blocked",
+    reason: blocked?.reason ?? "unknown",
+    ...(blocked?.detail === undefined ? {} : { detail: blocked.detail }),
+  };
+}
+
+export function settledWorkflowStatus(engineStatus: string, finalOutput: unknown): string {
+  return finalOutput !== null &&
+    typeof finalOutput === "object" &&
+    (finalOutput as { status?: unknown }).status === "blocked"
+    ? "blocked"
+    : engineStatus;
 }
 
 export function createIssueToPrWorkflow() {
@@ -173,13 +202,25 @@ export function createIssueToPrWorkflow() {
         timeoutMs: 30 * 60_000,
         statusDetail: "reviewing",
         prompt: () =>
-          'Review git diff against main. Return JSON only: {"route":"continue"} if there are no P0/P1 findings, otherwise {"route":"retry","detail":"actionable findings"}. Do not edit files.',
-        expectedOutput: '{ "route": "continue|retry", "detail": "optional" }',
+          'Review git diff against main. Print only stdout JSON: {"route":"continue"} if there are no P0/P1 findings, otherwise {"route":"retry","detail":"actionable findings"}. Do not use or mention a workflow submission tool. Do not edit files.',
+        expectedOutput:
+          '{ "route": "continue|retry|failed", "reason": "optional", "detail": "optional" }',
+      }),
+      beforeReview: compute({
+        run: ({ input }) => treeFingerprint((input as Input).worktree),
       }),
       assessReview: compute({
-        run: ({ outputs }) => {
+        run: ({ input, outputs }) => {
           const result = outputs.review as Route;
+          const before = outputs.beforeReview as TreeFingerprint;
+          const after = treeFingerprint((input as Input).worktree);
+          if (before.status !== after.status || before.diffHash !== after.diffHash)
+            throw new Error("review-modified-tree: reviewer changed the worktree");
+          if (result?.route === "failed" || result?.reason === "infra")
+            throw new Error(`infra: ${result?.detail ?? "reviewer could not run"}`);
           if (result?.route === "continue") return result;
+          if (result?.route !== "retry")
+            throw new Error("infra: reviewer did not return the stdout JSON contract");
           reviewFailures += 1;
           return reviewFailures <= 2
             ? { route: "retry", reason: "review", detail: result?.detail }
@@ -270,11 +311,7 @@ export function createIssueToPrWorkflow() {
         },
       }),
       blocked: compute({
-        run: ({ outputs }) => {
-          const candidates = [outputs.guard, outputs.assessReview, outputs.verify] as Route[];
-          const reason = candidates.find((item) => item?.route === "blocked");
-          return { status: "blocked", reason: reason?.reason ?? "unknown", detail: reason?.detail };
-        },
+        run: ({ outputs }) => blockedOutcome(outputs),
       }),
     },
     edges: [
@@ -287,9 +324,10 @@ export function createIssueToPrWorkflow() {
         from: "verify",
         switch: {
           on: "$.route",
-          cases: { continue: "review", retry: "implement", blocked: "blocked" },
+          cases: { continue: "beforeReview", retry: "implement", blocked: "blocked" },
         },
       },
+      { from: "beforeReview", to: "review" },
       { from: "review", to: "assessReview" },
       {
         from: "assessReview",
@@ -328,11 +366,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     defaultNodeTimeoutMs: 60 * 60_000,
   });
   const result = await engine.run(createIssueToPrWorkflow(), input, { runId });
+  const workflowStatus = settledWorkflowStatus(result.state.status, result.state.finalOutput);
   console.log(
     JSON.stringify(
       {
         runId,
-        workflowStatus: result.state.status,
+        workflowStatus,
         outcome: result.state.finalOutput,
         ...(result.state.error === undefined ? {} : { error: result.state.error }),
       },
@@ -340,7 +379,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       2,
     ),
   );
-  if (result.state.status !== "completed") process.exitCode = 1;
+  if (workflowStatus !== "completed") process.exitCode = 1;
 }
 if (
   process.argv[1] !== undefined &&
