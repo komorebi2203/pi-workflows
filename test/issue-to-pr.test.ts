@@ -84,6 +84,18 @@ describe("issue-to-pr workflow", () => {
     expect(changedAssertions(cwd)).toEqual(["math.test.js"]);
   });
 
+  it("detects a changed Node assert method assertion", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "issue-to-pr-node-assert-guard-"));
+    git(cwd, ["init", "-b", "main"]);
+    git(cwd, ["config", "user.email", "test@example.invalid"]);
+    git(cwd, ["config", "user.name", "Test"]);
+    writeFileSync(join(cwd, "math.test.js"), "assert.equal(add(2, 3), 5);\n");
+    git(cwd, ["add", "."]);
+    git(cwd, ["commit", "-m", "base"]);
+    writeFileSync(join(cwd, "math.test.js"), "assert.equal(add(2, 3), 6);\n");
+    expect(changedAssertions(cwd)).toEqual(["math.test.js"]);
+  });
+
   it("runs the CLI usage path through a symlink", () => {
     const cwd = mkdtempSync(join(tmpdir(), "issue-to-pr-bin-"));
     const link = join(cwd, "issue-to-pr");

@@ -75,7 +75,11 @@ export function changedAssertions(worktree: string): string[] {
   const found: string[] = [];
   for (const line of diff.split("\n")) {
     if (line.startsWith("+++ b/")) file = line.slice(6);
-    if (line.startsWith("-") && !line.startsWith("---") && /\b(?:assert|expect)\s*\(/u.test(line))
+    if (
+      line.startsWith("-") &&
+      !line.startsWith("---") &&
+      /\b(?:assert(?:\.\w+)?|expect)\s*\(/u.test(line)
+    )
       found.push(file);
   }
   return [...new Set(found)];
