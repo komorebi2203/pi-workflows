@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -39,5 +39,17 @@ describe("issue-to-pr workflow", () => {
     expect(changedAssertions(cwd)).toEqual([]);
     writeFileSync(join(cwd, "math.test.js"), "expect(add(2, 3)).toBe(6);\n");
     expect(changedAssertions(cwd)).toEqual(["math.test.js"]);
+  });
+
+  it("runs the CLI usage path through a symlink", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "issue-to-pr-bin-"));
+    const link = join(cwd, "issue-to-pr");
+    symlinkSync(join(process.cwd(), "dist/autocode/issue-to-pr.js"), link);
+    try {
+      execFileSync(process.execPath, [link], { encoding: "utf8", stdio: "pipe" });
+      throw new Error("CLI unexpectedly succeeded");
+    } catch (error) {
+      expect(String((error as { stderr?: Buffer }).stderr)).toContain("usage: issue-to-pr");
+    }
   });
 });

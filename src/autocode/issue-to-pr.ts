@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CliStepExecutor } from "../server/cli-executor.js";
@@ -335,7 +335,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     ),
   );
 }
-if (process.argv[1] === fileURLToPath(import.meta.url))
+if (
+  process.argv[1] !== undefined &&
+  realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+)
   void main().catch((error) => {
     console.error(`issue-to-pr failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
