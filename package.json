@@ -15,7 +15,10 @@
     "url": "git+https://github.com/osolmaz/pi-workflows.git"
   },
   "bin": {
-    "pi-workflows": "dist/viewer/cli.js"
+    "issue-to-pr": "dist/autocode/issue-to-pr.js",
+    "pi-workflows": "dist/viewer/cli.js",
+    "piw-gate-check": "dist/autocode/gate-check.js",
+    "piw-merge": "dist/autocode/merge.js"
   },
   "files": [
     "dist",

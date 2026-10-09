@@ -1090,6 +1090,35 @@ so tests and custom library integrations can script agent steps. The package's
 production extension does not use this as a selectable embedded runtime; it
 always sends runs to the global server.
 
+### External CLI agent steps
+
+An agent node can opt into a fresh external process instead of the run's Pi
+session. Set `executor: "cli"` and provide `cli.command` plus optional
+`cli.args`. Every `{prompt}` occurrence in an argument is replaced by the full
+step prompt; when no argument contains that marker, the prompt is appended as
+the final argument. The command must exit zero. A stdout JSON value becomes
+structured output; other stdout becomes a trimmed string. The result is
+validated and persisted through the normal node output, gate, transition, and
+event-log path.
+
+```typescript
+agent({
+  executor: "cli",
+  cli: {
+    command: "codex",
+    args: ["exec", "--skip-git-repo-check", "{prompt}"],
+  },
+  prompt: () => "Return a JSON object with an answer field.",
+  validate: (output) => output,
+});
+```
+
+A non-zero process exit fails the node immediately. Its error records the exit
+code and either `reason=quota` for recognizable quota/usage/rate-limit output or
+`reason=command` for other failures. The engine does not traverse outgoing
+edges after either failure. CLI nodes produce submitted JSON and therefore
+cannot use `assistantMessage()` output or a Pi-specific `model` override.
+
 ```typescript
 import { WorkflowEngine, type AgentStepExecutor } from "@osolmaz/pi-workflows";
 

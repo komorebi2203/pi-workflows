@@ -5144,6 +5144,13 @@ function snapshotNode(
   if (node.nodeType === "agent") {
     if (node.expectedOutput !== undefined) common.expectedOutput = node.expectedOutput;
     if (node.allowedTools !== undefined) common.allowedTools = [...node.allowedTools];
+    if (node.executor !== undefined) common.executor = node.executor;
+    if (node.cli !== undefined) {
+      common.cli = {
+        command: node.cli.command,
+        ...(node.cli.args === undefined ? {} : { args: [...node.cli.args] }),
+      };
+    }
   }
   if (node.nodeType === "compute" && node.settingsRoute === true) {
     common.settingsRoute = true;

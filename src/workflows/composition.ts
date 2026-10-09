@@ -467,6 +467,16 @@ function wrapNode(
     case "agent": {
       const agentCommon = {
         ...common,
+        ...(node.model === undefined ? {} : { model: { ...node.model } }),
+        ...(node.executor === undefined ? {} : { executor: node.executor }),
+        ...(node.cli === undefined
+          ? {}
+          : {
+              cli: {
+                command: node.cli.command,
+                ...(node.cli.args === undefined ? {} : { args: [...node.cli.args] }),
+              },
+            }),
         ...(node.allowedTools === undefined ? {} : { allowedTools: [...node.allowedTools] }),
       };
       const prompt = (context: WorkflowNodeContext) => node.prompt(project(context));

@@ -56,6 +56,29 @@ function updateLine(step: string, attempt: string): string {
 }
 
 describe("RpcStepExecutor submissions", () => {
+  it("sets the step model before sending its prompt", async () => {
+    const { fakePi, stdinLog } = await makeFakePi(
+      `sleep 0.2\nprintf '${submissionLine("work", "model", { done: true })}' >&2\nsleep 2\n`,
+    );
+    const executor = new RpcStepExecutor({
+      cwd: "/tmp",
+      registry: new ServerProcessRegistry("/tmp"),
+      piBin: fakePi,
+    });
+    const request = requestFor("work", "model");
+    request.model = { provider: "mesh", modelId: "tiny-local" };
+    await executor.runAgentStep(request, new AbortController().signal);
+    const commands = (await fs.readFile(stdinLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(commands.slice(0, 2)).toEqual([
+      { type: "set_model", provider: "mesh", modelId: "tiny-local" },
+      { type: "prompt", message: "do the step" },
+    ]);
+    await executor.close();
+  });
+
   it("resolves a submission reported over stderr", async () => {
     const { fakePi } = await makeFakePi(
       `sleep 0.2\nprintf '${submissionLine("work", "a1", { done: true })}' >&2\nsleep 2\n`,

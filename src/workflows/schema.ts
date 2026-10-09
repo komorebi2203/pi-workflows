@@ -59,6 +59,44 @@ export function assertValidAgentNode(node: AgentNodeDefinition, nodeId = "agent"
     fail(`node ${nodeId} requires a prompt function`);
   }
   if (
+    node.model !== undefined &&
+    (typeof node.model !== "object" ||
+      node.model === null ||
+      typeof node.model.provider !== "string" ||
+      node.model.provider.length === 0 ||
+      typeof node.model.modelId !== "string" ||
+      node.model.modelId.length === 0)
+  ) {
+    fail(`node ${nodeId} model requires non-empty provider and modelId strings`);
+  }
+  if (node.executor !== undefined && node.executor !== "cli") {
+    fail(`node ${nodeId} executor must be "cli" when provided`);
+  }
+  if (node.executor === "cli") {
+    if (
+      node.cli === undefined ||
+      typeof node.cli !== "object" ||
+      node.cli === null ||
+      typeof node.cli.command !== "string" ||
+      node.cli.command.length === 0 ||
+      (node.cli.args !== undefined &&
+        (!Array.isArray(node.cli.args) || node.cli.args.some((arg) => typeof arg !== "string")))
+    ) {
+      fail(`node ${nodeId} cli executor requires a command and optional string args`);
+    }
+    if (node.model !== undefined) {
+      fail(`node ${nodeId} cannot combine cli executor with a Pi model`);
+    }
+    if (node.allowedTools !== undefined) {
+      fail(`node ${nodeId} cannot combine cli executor with a Pi tool allowlist`);
+    }
+    if (typeof node.expectedOutput === "object") {
+      fail(`node ${nodeId} cli executor requires submitted JSON output`);
+    }
+  } else if (node.cli !== undefined) {
+    fail(`node ${nodeId} cli configuration requires executor "cli"`);
+  }
+  if (
     node.allowedTools !== undefined &&
     (!Array.isArray(node.allowedTools) ||
       node.allowedTools.some(

@@ -22,6 +22,7 @@ import type {
   WorkflowMountedSource,
   WorkflowSource,
 } from "../workflows/types.js";
+import { CliStepExecutor, RoutedStepExecutor } from "./cli-executor.js";
 import { RpcStepExecutor } from "./rpc-executor.js";
 import type { WorkflowRunnerLaunchEnvelope } from "./state.js";
 import { materializeRunnerContent } from "./workflow-runner-content.js";
@@ -361,33 +362,38 @@ export async function runWorkflowRunner(): Promise<number> {
     const store = new ServerBackedWorkflowStore(launch.runId, transport, ready.revision ?? 0);
     let executor: AgentStepExecutor;
     let closeExecutor: (() => Promise<void>) | undefined;
+    const processRegistry = {
+      register: async (pid: number) => {
+        await transport.request({
+          messageId: randomUUID(),
+          operation: "process.register",
+          kind: "runner.progress",
+          expectedRevision: 0,
+          payload: { pid },
+        });
+      },
+      unregister: async (pid: number) => {
+        await transport.request({
+          messageId: randomUUID(),
+          operation: "process.unregister",
+          kind: "runner.progress",
+          expectedRevision: 0,
+          payload: { pid },
+        });
+      },
+    };
     if (bootstrap.originSessionId !== null) {
-      executor = new InteractiveExecutor(store, bootstrap.candidateInteraction);
+      const interactive = new InteractiveExecutor(store, bootstrap.candidateInteraction);
+      executor = new RoutedStepExecutor(
+        interactive,
+        new CliStepExecutor({ cwd: launch.projectPath, registry: processRegistry }),
+      );
     } else {
       const rpc = new RpcStepExecutor({
         cwd: launch.projectPath,
         processGroup: "own",
         abortGraceMs: 1_000,
-        registry: {
-          register: async (pid) => {
-            await transport.request({
-              messageId: randomUUID(),
-              operation: "process.register",
-              kind: "runner.progress",
-              expectedRevision: 0,
-              payload: { pid },
-            });
-          },
-          unregister: async (pid) => {
-            await transport.request({
-              messageId: randomUUID(),
-              operation: "process.unregister",
-              kind: "runner.progress",
-              expectedRevision: 0,
-              payload: { pid },
-            });
-          },
-        },
+        registry: processRegistry,
         ...(bootstrap.piArgs === undefined ? {} : { piArgs: bootstrap.piArgs }),
       });
       const closeRpc = async () => await rpc.close();
@@ -398,7 +404,10 @@ export async function runWorkflowRunner(): Promise<number> {
       };
       process.on("SIGTERM", onShutdown);
       process.on("SIGINT", onShutdown);
-      executor = rpc;
+      executor = new RoutedStepExecutor(
+        rpc,
+        new CliStepExecutor({ cwd: launch.projectPath, registry: processRegistry }),
+      );
       closeExecutor = async () => {
         process.removeListener("SIGTERM", onShutdown);
         process.removeListener("SIGINT", onShutdown);

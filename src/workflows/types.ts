@@ -133,6 +133,12 @@ export type AgentExpectedOutput = string | AssistantMessageOutput;
 
 type AgentNodeBase = WorkflowNodeCommon & {
   nodeType: "agent";
+  /** Pi RPC model selected immediately before this step runs. */
+  model?: { provider: string; modelId: string };
+  /** Opt into an external command instead of the run's Pi executor. */
+  executor?: "cli";
+  /** External command configuration. `{prompt}` in an argument is replaced with the step prompt. */
+  cli?: { command: string; args?: string[] };
   /** Optional exact tool allowlist. Matching workflow submit/update calls remain allowed. */
   allowedTools?: string[];
   prompt: (context: WorkflowNodeContext) => MaybePromise<string>;
@@ -710,6 +716,8 @@ export type WorkflowNodeSnapshot = {
   summary?: string;
   expectedOutput?: AgentExpectedOutput;
   allowedTools?: string[];
+  executor?: "cli";
+  cli?: { command: string; args?: string[] };
   settingsRoute?: true;
   actionExecution?: "function" | "shell";
   effect?: { type: string; recovery: WorkflowEffectRecovery };
@@ -870,6 +878,9 @@ export type AgentStepPresentation = {
 export type AgentStepRequest = {
   contract: AgentStepContract;
   prompt: string;
+  model?: { provider: string; modelId: string };
+  executor?: "cli";
+  cli?: { command: string; args?: string[] };
   presentation?: AgentStepPresentation;
   /**
    * Validate a submission from the model. Returns the normalized output or an
