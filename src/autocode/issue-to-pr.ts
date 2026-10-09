@@ -143,6 +143,8 @@ export function createIssueToPrWorkflow() {
             ["worktree", "add", "-b", value.branch, value.worktree, "origin/main"],
             mirror,
           );
+          run("git", ["config", "user.name", "pi-workflows"], value.worktree);
+          run("git", ["config", "user.email", "pi-workflows@localhost"], value.worktree);
           const issue = run(
             "gh",
             ["issue", "view", String(value.issue), "-R", REPO, "--json", "number,title,body,url"],
