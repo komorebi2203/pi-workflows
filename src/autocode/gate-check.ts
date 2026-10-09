@@ -18,11 +18,17 @@ const current = JSON.parse(
     encoding: "utf8",
   }),
 ) as { headRefOid: string; state: string };
+const remoteHead = execFileSync("git", ["ls-remote", "origin", `refs/pull/${pr}/head`], {
+  cwd: "/srv/piw/repos/autocode-sandbox",
+  encoding: "utf8",
+})
+  .trim()
+  .split(/\s+/u)[0];
 if (current.state !== "OPEN") {
   console.error(`REFUSE: PR state is ${current.state}`);
   process.exit(1);
 }
-if (!record.sha || record.sha !== current.headRefOid) {
+if (!record.sha || !remoteHead || record.sha !== remoteHead || remoteHead !== current.headRefOid) {
   console.error("REFUSE: SHA mismatch");
   process.exit(1);
 }
