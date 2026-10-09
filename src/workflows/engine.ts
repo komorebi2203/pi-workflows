@@ -1351,6 +1351,7 @@ export class WorkflowEngine {
       {
         contract,
         prompt,
+        ...(node.model === undefined ? {} : { model: { ...node.model } }),
         ...(state.runTitle !== undefined || node.statusDetail !== undefined
           ? {
               presentation: {

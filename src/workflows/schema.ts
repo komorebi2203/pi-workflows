@@ -59,6 +59,17 @@ export function assertValidAgentNode(node: AgentNodeDefinition, nodeId = "agent"
     fail(`node ${nodeId} requires a prompt function`);
   }
   if (
+    node.model !== undefined &&
+    (typeof node.model !== "object" ||
+      node.model === null ||
+      typeof node.model.provider !== "string" ||
+      node.model.provider.length === 0 ||
+      typeof node.model.modelId !== "string" ||
+      node.model.modelId.length === 0)
+  ) {
+    fail(`node ${nodeId} model requires non-empty provider and modelId strings`);
+  }
+  if (
     node.allowedTools !== undefined &&
     (!Array.isArray(node.allowedTools) ||
       node.allowedTools.some(
