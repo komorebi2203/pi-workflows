@@ -25,6 +25,16 @@ type Route = {
   detail?: string;
 };
 type TreeFingerprint = { status: string; diffHash: string };
+type RunEventState = "running" | "pr" | "gate" | "blocked" | "failed" | "completed";
+type RunEvent = {
+  state: RunEventState;
+  reason?: string;
+  pr?: number;
+  prUrl?: string;
+  headSha?: string;
+  heartbeat?: boolean;
+};
+type RunEventEmitter = (event: RunEvent) => void;
 
 function run(command: string, args: string[], cwd?: string): string {
   return execFileSync(command, args, {
@@ -121,7 +131,7 @@ export function settledWorkflowStatus(engineStatus: string, finalOutput: unknown
     : engineStatus;
 }
 
-export function createIssueToPrWorkflow() {
+export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined) {
   let verifyFailures = 0;
   let reviewFailures = 0;
   return defineWorkflow({
@@ -185,7 +195,7 @@ export function createIssueToPrWorkflow() {
         executor: "cli",
         cli: { command: "/opt/piw/bin/piw-role", args: ["plan", "{prompt}"] },
         statusDetail: "planning from the issue",
-        prompt: ({ input }) =>
+        prompt: () =>
           `Read .piw-issue.json, which contains the authorized task. Print a short implementation and verification plan as plain stdout text. Do not use or mention a workflow submission tool. Do not change files.`,
         expectedOutput: "A short plain-text plan.",
       }),
@@ -200,7 +210,7 @@ export function createIssueToPrWorkflow() {
         cli: { command: "/opt/piw/bin/piw-role", args: ["implement", "{prompt}"] },
         timeoutMs: 45 * 60_000,
         statusDetail: "implementing",
-        prompt: ({ input, outputs }) =>
+        prompt: ({ outputs }) =>
           `Implement the task in .piw-issue.json. Plan:\n${String(outputs.plan)}\nInspect .piw-verify.log if present. Do not commit, push, open a PR, or modify an existing test assertion.`,
         expectedOutput: "A concise implementation summary.",
       }),
@@ -300,13 +310,15 @@ export function createIssueToPrWorkflow() {
             ],
             value.worktree,
           );
-          return JSON.parse(
+          const opened = JSON.parse(
             run(
               "gh",
               ["pr", "view", url, "-R", REPO, "--json", "number,headRefOid,url"],
               value.worktree,
             ),
           ) as { number: number; headRefOid: string; url: string };
+          emit({ state: "pr", pr: opened.number, prUrl: opened.url, headSha: opened.headRefOid });
+          return opened;
         },
       }),
       gate: compute({
@@ -335,6 +347,7 @@ export function createIssueToPrWorkflow() {
             `${JSON.stringify({ schema: "piw.local-gate.v1", repository: REPO, issue: value.issue, pr: pr.number, sha: pr.headRefOid, status: "pending-human-merge", createdAt: new Date().toISOString() }, null, 2)}\n`,
             { mode: 0o600 },
           );
+          emit({ state: "gate", pr: pr.number, prUrl: pr.url, headSha: pr.headRefOid });
           return {
             status: "completed",
             pr: pr.number,
@@ -383,6 +396,7 @@ function usage(): never {
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const at = argv.indexOf("--issue");
   const tf = argv.indexOf("--task-file");
+  const ri = argv.indexOf("--run-id");
   if (
     at >= 0 === tf >= 0 ||
     (at >= 0 && !/^\d+$/u.test(argv[at + 1] ?? "")) ||
@@ -407,10 +421,13 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       usage();
     linearIdentifier = task.identifier;
   }
-  const runId = `${new Date()
+  const generatedRunId = `${new Date()
     .toISOString()
     .replace(/[-:.TZ]/gu, "")
     .slice(0, 14)}-${randomUUID().slice(0, 8)}`;
+  const requestedRunId = ri >= 0 ? argv[ri + 1] : undefined;
+  if (requestedRunId !== undefined && !/^[A-Za-z0-9._:-]{1,128}$/u.test(requestedRunId)) usage();
+  const runId = requestedRunId ?? generatedRunId;
   const input: Input = {
     ...(issue === undefined ? {} : { issue }),
     ...(taskFile === undefined ? {} : { taskFile }),
@@ -419,26 +436,86 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     worktree: `${ROOT}/work/${runId}`,
     branch: `autocode/${linearIdentifier ?? issue}-${runId}`,
   };
+  let revision = 0;
+  let latestState: RunEventState = "running";
+  let latestPr: Omit<RunEvent, "state"> = {};
+  const emit: RunEventEmitter = (event) => {
+    latestState = event.state;
+    latestPr = {
+      ...latestPr,
+      ...(event.pr === undefined ? {} : { pr: event.pr }),
+      ...(event.prUrl === undefined ? {} : { prUrl: event.prUrl }),
+      ...(event.headSha === undefined ? {} : { headSha: event.headSha }),
+    };
+    const payload = {
+      runId,
+      revision: revision++,
+      state: event.state,
+      eventAt: new Date().toISOString(),
+      ...(linearIdentifier === undefined ? {} : { linearIdentifier }),
+      ...latestPr,
+      ...(event.reason === undefined ? {} : { reason: event.reason.slice(0, 2000) }),
+      ...(event.heartbeat === undefined ? {} : { heartbeat: event.heartbeat }),
+    };
+    const submitted = spawnSync(
+      "/opt/piw/bin/piw-relay-submit",
+      ["event", JSON.stringify(payload)],
+      {
+        encoding: "utf8",
+      },
+    );
+    if (submitted.status !== 0) {
+      const detail = (
+        submitted.stderr ||
+        submitted.error?.message ||
+        `exit ${submitted.status}`
+      ).trim();
+      console.error(`relay-submit failed: ${detail}`);
+    }
+  };
+  emit({ state: "running" });
+  const heartbeatMinutes = Number(process.env.PIW_RUN_HEARTBEAT_MINUTES ?? "10");
+  const heartbeat = setInterval(
+    () => emit({ state: latestState, ...latestPr, heartbeat: true }),
+    Math.max(1, heartbeatMinutes) * 60_000,
+  );
+  heartbeat.unref();
   const engine = new WorkflowEngine({
     executor: new CliStepExecutor({ cwd: ROOT, env: { PIW_WORKTREE: input.worktree } }),
     databasePath: `${ROOT}/state/workflows.sqlite`,
     defaultNodeTimeoutMs: 60 * 60_000,
   });
-  const result = await engine.run(createIssueToPrWorkflow(), input, { runId });
-  const workflowStatus = settledWorkflowStatus(result.state.status, result.state.finalOutput);
-  console.log(
-    JSON.stringify(
-      {
-        runId,
-        workflowStatus,
-        outcome: result.state.finalOutput,
-        ...(result.state.error === undefined ? {} : { error: result.state.error }),
-      },
-      null,
-      2,
-    ),
-  );
-  if (workflowStatus !== "completed") process.exitCode = 1;
+  try {
+    const result = await engine.run(createIssueToPrWorkflow(emit), input, { runId });
+    const workflowStatus = settledWorkflowStatus(result.state.status, result.state.finalOutput);
+    const reason =
+      result.state.error ??
+      ((result.state.finalOutput as { reason?: string } | undefined)?.reason || workflowStatus);
+    if (workflowStatus === "blocked") emit({ state: "blocked", reason });
+    else if (workflowStatus === "completed") emit({ state: "completed" });
+    else
+      emit({
+        state: "failed",
+        reason: /Resource not accessible by personal access token.*statusCheckRollup/su.test(reason)
+          ? "checks permission"
+          : reason,
+      });
+    console.log(
+      JSON.stringify(
+        {
+          runId,
+          workflowStatus,
+          outcome: result.state.finalOutput,
+          ...(result.state.error === undefined ? {} : { error: result.state.error }),
+        },
+        null,
+        2,
+      ),
+    );
+    if (workflowStatus !== "completed") process.exitCode = 1;
+  } finally {
+    clearInterval(heartbeat);
+  }
 }
 if (
   process.argv[1] !== undefined &&
