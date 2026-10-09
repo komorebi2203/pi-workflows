@@ -35,6 +35,7 @@ type RunEvent = {
   prUrl?: string;
   headSha?: string;
   heartbeat?: boolean;
+  taskFile?: string;
 };
 type RunEventEmitter = (event: RunEvent) => void;
 
@@ -297,6 +298,7 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
             [
               "pr",
               "create",
+              "--draft",
               "-R",
               REPO,
               "--head",
@@ -460,6 +462,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       ...latestPr,
       ...(event.reason === undefined ? {} : { reason: event.reason.slice(0, 2000) }),
       ...(event.heartbeat === undefined ? {} : { heartbeat: event.heartbeat }),
+      ...(taskFile === undefined ? {} : { taskFile }),
     };
     const submitted = spawnSync(
       "/opt/piw/bin/piw-relay-submit",
