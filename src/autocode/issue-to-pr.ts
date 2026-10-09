@@ -11,7 +11,14 @@ import { WorkflowEngine } from "../workflows/engine.js";
 
 const REPO = "komorebi2203/autocode-sandbox";
 const ROOT = "/srv/piw";
-type Input = { issue: number; runId: string; worktree: string; branch: string };
+type Input = {
+  issue?: number;
+  linearIdentifier?: string;
+  taskFile?: string;
+  runId: string;
+  worktree: string;
+  branch: string;
+};
 type Route = {
   route: "continue" | "retry" | "blocked" | "failed";
   reason?: string;
@@ -29,8 +36,8 @@ function run(command: string, args: string[], cwd?: string): string {
 function inputParser(value: unknown): Input {
   const valueInput = value as Partial<Input>;
   if (
-    !Number.isSafeInteger(valueInput.issue) ||
-    Number(valueInput.issue) < 1 ||
+    (!valueInput.taskFile &&
+      (!Number.isSafeInteger(valueInput.issue) || Number(valueInput.issue) < 1)) ||
     !valueInput.runId ||
     !valueInput.worktree ||
     !valueInput.branch
@@ -121,7 +128,8 @@ export function createIssueToPrWorkflow() {
     source: import.meta.url,
     contractId: "pi-workflows.issue-to-pr.v1",
     name: "issue-to-pr",
-    title: ({ input }) => `issue-to-pr #${(input as Input).issue}`,
+    title: ({ input }) =>
+      `issue-to-pr ${(input as Input).linearIdentifier ?? `#${(input as Input).issue}`}`,
     input: inputParser,
     startAt: "preflight",
     maxSteps: 24,
@@ -154,11 +162,21 @@ export function createIssueToPrWorkflow() {
           );
           run("git", ["config", "user.name", "pi-workflows"], value.worktree);
           run("git", ["config", "user.email", "pi-workflows@localhost"], value.worktree);
-          const issue = run(
-            "gh",
-            ["issue", "view", String(value.issue), "-R", REPO, "--json", "number,title,body,url"],
-            value.worktree,
-          );
+          const issue = value.taskFile
+            ? readFileSync(value.taskFile, "utf8").trim()
+            : run(
+                "gh",
+                [
+                  "issue",
+                  "view",
+                  String(value.issue),
+                  "-R",
+                  REPO,
+                  "--json",
+                  "number,title,body,url",
+                ],
+                value.worktree,
+              );
           writeFileSync(join(value.worktree, ".piw-issue.json"), `${issue}\n`, { mode: 0o600 });
           return { route: "continue" };
         },
@@ -168,7 +186,7 @@ export function createIssueToPrWorkflow() {
         cli: { command: "/opt/piw/bin/piw-role", args: ["plan", "{prompt}"] },
         statusDetail: "planning from the issue",
         prompt: ({ input }) =>
-          `Read .piw-issue.json, which contains issue ${(input as Input).issue} fetched with gh issue view. Print a short implementation and verification plan as plain stdout text. Do not use or mention a workflow submission tool. Do not change files.`,
+          `Read .piw-issue.json, which contains the authorized task. Print a short implementation and verification plan as plain stdout text. Do not use or mention a workflow submission tool. Do not change files.`,
         expectedOutput: "A short plain-text plan.",
       }),
       savePlan: compute({
@@ -183,7 +201,7 @@ export function createIssueToPrWorkflow() {
         timeoutMs: 45 * 60_000,
         statusDetail: "implementing",
         prompt: ({ input, outputs }) =>
-          `Implement issue ${(input as Input).issue} in the current worktree. Plan:\n${String(outputs.plan)}\nInspect .piw-verify.log if present. Do not commit, push, open a PR, or modify an existing test assertion.`,
+          `Implement the task in .piw-issue.json. Plan:\n${String(outputs.plan)}\nInspect .piw-verify.log if present. Do not commit, push, open a PR, or modify an existing test assertion.`,
         expectedOutput: "A concise implementation summary.",
       }),
       verify: compute({
@@ -259,7 +277,8 @@ export function createIssueToPrWorkflow() {
             ["reset", "--", ".piw-issue.json", ".piw-plan.md", ".piw-verify.log"],
             value.worktree,
           );
-          run("git", ["commit", "-m", `feat: resolve issue ${value.issue}`], value.worktree);
+          const taskRef = value.linearIdentifier ?? `issue ${value.issue}`;
+          run("git", ["commit", "-m", `feat: resolve ${taskRef}`], value.worktree);
           run("git", ["push", "-u", "origin", value.branch], value.worktree);
           const url = run(
             "gh",
@@ -273,9 +292,11 @@ export function createIssueToPrWorkflow() {
               "--base",
               "main",
               "--title",
-              `feat: resolve issue ${value.issue}`,
+              `feat: resolve ${taskRef}`,
               "--body",
-              `Closes #${value.issue}`,
+              value.linearIdentifier
+                ? `Linear: ${value.linearIdentifier}`
+                : `Closes #${value.issue}`,
             ],
             value.worktree,
           );
@@ -356,22 +377,47 @@ export function createIssueToPrWorkflow() {
 }
 
 function usage(): never {
-  console.error("usage: issue-to-pr --issue NUMBER");
+  console.error("usage: issue-to-pr (--issue NUMBER | --task-file PATH)");
   process.exit(2);
 }
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const at = argv.indexOf("--issue");
-  if (at < 0 || !/^\d+$/u.test(argv[at + 1] ?? "")) usage();
-  const issue = Number(argv[at + 1]);
+  const tf = argv.indexOf("--task-file");
+  if (
+    at >= 0 === tf >= 0 ||
+    (at >= 0 && !/^\d+$/u.test(argv[at + 1] ?? "")) ||
+    (tf >= 0 && !argv[tf + 1])
+  )
+    usage();
+  const issue = at >= 0 ? Number(argv[at + 1]) : undefined;
+  const taskFile = tf >= 0 ? argv[tf + 1] : undefined;
+  let linearIdentifier: string | undefined;
+  if (taskFile) {
+    const task = JSON.parse(readFileSync(taskFile, "utf8")) as {
+      identifier?: unknown;
+      title?: unknown;
+      body?: unknown;
+    };
+    if (
+      typeof task.identifier !== "string" ||
+      !/^[A-Z][A-Z0-9]+-\d+$/u.test(task.identifier) ||
+      typeof task.title !== "string" ||
+      typeof task.body !== "string"
+    )
+      usage();
+    linearIdentifier = task.identifier;
+  }
   const runId = `${new Date()
     .toISOString()
     .replace(/[-:.TZ]/gu, "")
     .slice(0, 14)}-${randomUUID().slice(0, 8)}`;
   const input: Input = {
-    issue,
+    ...(issue === undefined ? {} : { issue }),
+    ...(taskFile === undefined ? {} : { taskFile }),
+    ...(linearIdentifier === undefined ? {} : { linearIdentifier }),
     runId,
     worktree: `${ROOT}/work/${runId}`,
-    branch: `autocode/${issue}-${runId}`,
+    branch: `autocode/${linearIdentifier ?? issue}-${runId}`,
   };
   const engine = new WorkflowEngine({
     executor: new CliStepExecutor({ cwd: ROOT, env: { PIW_WORKTREE: input.worktree } }),
