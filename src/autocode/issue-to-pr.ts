@@ -87,6 +87,11 @@ export function treeFingerprint(worktree: string): TreeFingerprint {
   return { status, diffHash: createHash("sha256").update(diff).digest("hex") };
 }
 
+export function assertReviewUnmodified(before: TreeFingerprint, after: TreeFingerprint): void {
+  if (before.status !== after.status || before.diffHash !== after.diffHash)
+    throw new Error("review-modified-tree: reviewer changed the worktree");
+}
+
 export function blockedOutcome(outputs: Record<string, unknown>) {
   const candidates = [outputs.guard, outputs.assessReview, outputs.verify] as Route[];
   const blocked = candidates.find((item) => item?.route === "blocked");
@@ -216,8 +221,7 @@ export function createIssueToPrWorkflow() {
           const result = outputs.review as Route;
           const before = outputs.beforeReview as TreeFingerprint;
           const after = treeFingerprint((input as Input).worktree);
-          if (before.status !== after.status || before.diffHash !== after.diffHash)
-            throw new Error("review-modified-tree: reviewer changed the worktree");
+          assertReviewUnmodified(before, after);
           if (result?.route === "failed" || result?.reason === "infra")
             throw new Error(`infra: ${result?.detail ?? "reviewer could not run"}`);
           if (result?.route === "continue") return result;

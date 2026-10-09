@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  assertReviewUnmodified,
   blockedOutcome,
   changedAssertions,
   createIssueToPrWorkflow,
@@ -64,7 +65,9 @@ describe("issue-to-pr workflow", () => {
     git(cwd, ["commit", "-m", "base"]);
     const before = treeFingerprint(cwd);
     writeFileSync(join(cwd, "decoy.txt"), "written during review\n");
-    expect(treeFingerprint(cwd)).not.toEqual(before);
+    expect(() => assertReviewUnmodified(before, treeFingerprint(cwd))).toThrow(
+      "review-modified-tree",
+    );
   });
 
   it("detects a changed existing assertion but permits a new test", () => {
