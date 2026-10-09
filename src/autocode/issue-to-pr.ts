@@ -232,7 +232,10 @@ export function createIssueToPrWorkflow() {
       guard: compute({
         statusDetail: "guarding test assertions",
         run: ({ input }) => {
-          const files = changedAssertions((input as Input).worktree);
+          const worktree = (input as Input).worktree;
+          const files = changedAssertions(worktree);
+          if (run("git", ["diff", "--name-only", "HEAD"], worktree) === "")
+            return { route: "blocked", reason: "review", detail: "no implementation changes" };
           return files.length
             ? { route: "blocked", reason: "test-guard", detail: files.join(", ") }
             : { route: "continue" };
