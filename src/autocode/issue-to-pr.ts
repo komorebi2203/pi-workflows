@@ -159,7 +159,7 @@ export function createIssueToPrWorkflow() {
         cli: { command: "/opt/piw/bin/piw-role", args: ["plan", "{prompt}"] },
         statusDetail: "planning from the issue",
         prompt: ({ input }) =>
-          `Read issue ${(input as Input).issue} using gh issue view -R ${REPO}. Write a short implementation and verification plan. Do not change files.`,
+          `Read .piw-issue.json, which contains issue ${(input as Input).issue} fetched with gh issue view. Print a short implementation and verification plan as plain stdout text. Do not use or mention a workflow submission tool. Do not change files.`,
         expectedOutput: "A short plain-text plan.",
       }),
       savePlan: compute({
