@@ -329,11 +329,17 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const result = await engine.run(createIssueToPrWorkflow(), input, { runId });
   console.log(
     JSON.stringify(
-      { runId, workflowStatus: result.state.status, outcome: result.state.finalOutput },
+      {
+        runId,
+        workflowStatus: result.state.status,
+        outcome: result.state.finalOutput,
+        ...(result.state.error === undefined ? {} : { error: result.state.error }),
+      },
       null,
       2,
     ),
   );
+  if (result.state.status !== "completed") process.exitCode = 1;
 }
 if (
   process.argv[1] !== undefined &&
