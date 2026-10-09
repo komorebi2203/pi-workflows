@@ -1,5 +1,5 @@
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -9,6 +9,7 @@ import {
   changedAssertions,
   createIssueToPrWorkflow,
   settledWorkflowStatus,
+  TerminalEventGuard,
   treeFingerprint,
 } from "../src/autocode/issue-to-pr.js";
 import { compute, defineWorkflow } from "../src/workflows/definition.js";
@@ -20,6 +21,50 @@ function git(cwd: string, args: string[]): void {
 }
 
 describe("issue-to-pr workflow", () => {
+  it("emits exactly one failed event for a forced issue-read throw", () => {
+    const events: Array<{ state: string; reason?: string }> = [];
+    const guard = new TerminalEventGuard((event) => events.push(event));
+    try {
+      throw new Error("issue-read:forced fixture failure");
+    } catch (error) {
+      guard.setFallback(error);
+    } finally {
+      guard.finish();
+    }
+    expect(events).toEqual([{ state: "failed", reason: "issue-read" }]);
+  });
+
+  it("emits exactly one failed event on SIGTERM", async () => {
+    const source = `
+      import { appendFileSync } from "node:fs";
+      import { TerminalEventGuard } from ${JSON.stringify(new URL("../dist/autocode/issue-to-pr.js", import.meta.url).href)};
+      new TerminalEventGuard(event => appendFileSync(process.argv[1], JSON.stringify(event) + "\\n"));
+      console.log("ready");
+      setInterval(() => {}, 1000);
+    `;
+    const output = join(mkdtempSync(join(tmpdir(), "issue-to-pr-sigterm-")), "events.jsonl");
+    writeFileSync(output, "");
+    const child = spawn(process.execPath, ["--input-type=module", "-e", source, output], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    await new Promise<void>((resolve) => child.stdout.once("data", () => resolve()));
+    child.kill("SIGTERM");
+    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    expect(
+      readFileSync(output, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line)),
+    ).toEqual([{ state: "failed", reason: "crash:SIGTERM" }]);
+  });
+
+  it("does not add a failed event after normal completion", () => {
+    const events: Array<{ state: string; reason?: string }> = [];
+    const guard = new TerminalEventGuard((event) => events.push(event));
+    guard.emit({ state: "completed" });
+    guard.finish();
+    expect(events).toEqual([{ state: "completed" }]);
+  });
   it("defines bounded verify and review loops before guard and PR", () => {
     const workflow = createIssueToPrWorkflow();
     expect(workflow.name).toBe("issue-to-pr");

@@ -39,6 +39,50 @@ type RunEvent = {
 };
 type RunEventEmitter = (event: RunEvent) => void;
 
+export class TerminalEventGuard {
+  private terminal = false;
+  private fallbackReason = "crash:process exited before a terminal event";
+  private readonly onExit = () => this.fail(this.fallbackReason);
+  private readonly onSigterm = () => {
+    this.fail("crash:SIGTERM");
+    process.exit(143);
+  };
+
+  constructor(private readonly emitEvent: RunEventEmitter) {
+    process.once("exit", this.onExit);
+    process.once("SIGTERM", this.onSigterm);
+  }
+
+  emit(event: RunEvent): void {
+    if (this.terminal) return;
+    if (["blocked", "failed", "completed"].includes(event.state)) this.terminal = true;
+    this.emitEvent(event);
+  }
+
+  setFallback(error: unknown): void {
+    this.fallbackReason = crashReason(error);
+  }
+
+  fail(reason = this.fallbackReason): void {
+    this.emit({ state: "failed", reason });
+  }
+
+  finish(): void {
+    this.fail();
+    process.off("exit", this.onExit);
+    process.off("SIGTERM", this.onSigterm);
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function crashReason(error: unknown): string {
+  const message = errorMessage(error);
+  return message.startsWith("issue-read:") ? "issue-read" : `crash:${message}`;
+}
+
 function run(command: string, args: string[], cwd?: string): string {
   return execFileSync(command, args, {
     cwd,
@@ -175,9 +219,11 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
           );
           run("git", ["config", "user.name", "pi-workflows"], value.worktree);
           run("git", ["config", "user.email", "pi-workflows@localhost"], value.worktree);
-          const issue = value.taskFile
-            ? readFileSync(value.taskFile, "utf8").trim()
-            : run(
+          let issue: string;
+          if (value.taskFile) issue = readFileSync(value.taskFile, "utf8").trim();
+          else {
+            try {
+              issue = run(
                 "gh",
                 [
                   "issue",
@@ -190,6 +236,10 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
                 ],
                 value.worktree,
               );
+            } catch (error) {
+              throw new Error(`issue-read:${errorMessage(error)}`);
+            }
+          }
           writeFileSync(join(value.worktree, ".piw-issue.json"), `${issue}\n`, { mode: 0o600 });
           return { route: "continue" };
         },
@@ -397,35 +447,7 @@ function usage(): never {
   process.exit(2);
 }
 export async function main(argv = process.argv.slice(2)): Promise<void> {
-  const at = argv.indexOf("--issue");
-  const tf = argv.indexOf("--task-file");
   const ri = argv.indexOf("--run-id");
-  if (
-    at >= 0 === tf >= 0 ||
-    (at >= 0 && !/^\d+$/u.test(argv[at + 1] ?? "")) ||
-    (tf >= 0 && !argv[tf + 1])
-  )
-    usage();
-  const issue = at >= 0 ? Number(argv[at + 1]) : undefined;
-  const taskFile = tf >= 0 ? argv[tf + 1] : undefined;
-  let linearIdentifier: string | undefined;
-  let taskTitle: string | undefined;
-  if (taskFile) {
-    const task = JSON.parse(readFileSync(taskFile, "utf8")) as {
-      identifier?: unknown;
-      title?: unknown;
-      body?: unknown;
-    };
-    if (
-      (task.identifier !== undefined &&
-        (typeof task.identifier !== "string" || !/^[A-Z][A-Z0-9]+-\d+$/u.test(task.identifier))) ||
-      typeof task.title !== "string" ||
-      typeof task.body !== "string"
-    )
-      usage();
-    linearIdentifier = task.identifier as string | undefined;
-    taskTitle = task.title;
-  }
   const generatedRunId = `${new Date()
     .toISOString()
     .replace(/[-:.TZ]/gu, "")
@@ -433,19 +455,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const requestedRunId = ri >= 0 ? argv[ri + 1] : undefined;
   if (requestedRunId !== undefined && !/^[A-Za-z0-9._:-]{1,128}$/u.test(requestedRunId)) usage();
   const runId = requestedRunId ?? generatedRunId;
-  const input: Input = {
-    ...(issue === undefined ? {} : { issue }),
-    ...(taskFile === undefined ? {} : { taskFile }),
-    ...(linearIdentifier === undefined ? {} : { linearIdentifier }),
-    ...(taskTitle === undefined ? {} : { taskTitle }),
-    runId,
-    worktree: `${ROOT}/work/${runId}`,
-    branch: `autocode/${linearIdentifier ?? issue ?? "task"}-${runId}`,
-  };
   let revision = 0;
   let latestState: RunEventState = "running";
   let latestPr: Omit<RunEvent, "state"> = {};
-  const emit: RunEventEmitter = (event) => {
+  let linearIdentifier: string | undefined;
+  let taskFile: string | undefined;
+  const relayEmit: RunEventEmitter = (event) => {
     latestState = event.state;
     latestPr = {
       ...latestPr,
@@ -467,9 +482,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     const submitted = spawnSync(
       "/opt/piw/bin/piw-relay-submit",
       ["event", JSON.stringify(payload)],
-      {
-        encoding: "utf8",
-      },
+      { encoding: "utf8" },
     );
     if (submitted.status !== 0) {
       const detail = (
@@ -480,19 +493,61 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       console.error(`relay-submit failed: ${detail}`);
     }
   };
-  emit({ state: "running" });
-  const heartbeatMinutes = Number(process.env.PIW_RUN_HEARTBEAT_MINUTES ?? "10");
-  const heartbeat = setInterval(
-    () => emit({ state: latestState, ...latestPr, heartbeat: true }),
-    Math.max(1, heartbeatMinutes) * 60_000,
-  );
-  heartbeat.unref();
-  const engine = new WorkflowEngine({
-    executor: new CliStepExecutor({ cwd: ROOT, env: { PIW_WORKTREE: input.worktree } }),
-    databasePath: `${ROOT}/state/workflows.sqlite`,
-    defaultNodeTimeoutMs: 60 * 60_000,
-  });
+  const terminal = new TerminalEventGuard(relayEmit);
+  let heartbeat: NodeJS.Timeout | undefined;
   try {
+    const at = argv.indexOf("--issue");
+    const tf = argv.indexOf("--task-file");
+    if (
+      at >= 0 === tf >= 0 ||
+      (at >= 0 && !/^\d+$/u.test(argv[at + 1] ?? "")) ||
+      (tf >= 0 && !argv[tf + 1])
+    )
+      usage();
+    const issue = at >= 0 ? Number(argv[at + 1]) : undefined;
+    taskFile = tf >= 0 ? argv[tf + 1] : undefined;
+    let taskTitle: string | undefined;
+    if (taskFile) {
+      const task = JSON.parse(readFileSync(taskFile, "utf8")) as {
+        identifier?: unknown;
+        title?: unknown;
+        body?: unknown;
+      };
+      if (
+        (task.identifier !== undefined &&
+          (typeof task.identifier !== "string" ||
+            !/^[A-Z][A-Z0-9]+-\d+$/u.test(task.identifier))) ||
+        typeof task.title !== "string" ||
+        typeof task.body !== "string"
+      )
+        usage();
+      linearIdentifier = task.identifier as string | undefined;
+      taskTitle = task.title;
+    }
+    const input: Input = {
+      ...(issue === undefined ? {} : { issue }),
+      ...(taskFile === undefined ? {} : { taskFile }),
+      ...(linearIdentifier === undefined ? {} : { linearIdentifier }),
+      ...(taskTitle === undefined ? {} : { taskTitle }),
+      runId,
+      worktree: `${ROOT}/work/${runId}`,
+      branch: `autocode/${linearIdentifier ?? issue ?? "task"}-${runId}`,
+    };
+    const emit: RunEventEmitter = (event) => {
+      terminal.emit(event);
+    };
+    emit({ state: "running" });
+    const heartbeatMinutes = Number(process.env.PIW_RUN_HEARTBEAT_MINUTES ?? "10");
+    heartbeat = setInterval(
+      () => emit({ state: latestState, ...latestPr, heartbeat: true }),
+      Math.max(1, heartbeatMinutes) * 60_000,
+    );
+    heartbeat.unref();
+    const engine = new WorkflowEngine({
+      executor: new CliStepExecutor({ cwd: ROOT, env: { PIW_WORKTREE: input.worktree } }),
+      databasePath: `${ROOT}/state/workflows.sqlite`,
+      defaultNodeTimeoutMs: 60 * 60_000,
+    });
     const result = await engine.run(createIssueToPrWorkflow(emit), input, { runId });
     const workflowStatus = settledWorkflowStatus(result.state.status, result.state.finalOutput);
     const reason =
@@ -503,7 +558,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     else
       emit({
         state: "failed",
-        reason,
+        reason: crashReason(reason),
       });
     console.log(
       JSON.stringify(
@@ -518,8 +573,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       ),
     );
     if (workflowStatus !== "completed") process.exitCode = 1;
+  } catch (error) {
+    terminal.setFallback(error);
+    throw error;
   } finally {
-    clearInterval(heartbeat);
+    if (heartbeat !== undefined) clearInterval(heartbeat);
+    terminal.finish();
   }
 }
 if (
@@ -527,6 +586,6 @@ if (
   realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
 )
   void main().catch((error) => {
-    console.error(`issue-to-pr failed: ${error instanceof Error ? error.message : String(error)}`);
-    process.exit(1);
+    console.error(`issue-to-pr failed: ${errorMessage(error)}`);
+    process.exitCode = 1;
   });
