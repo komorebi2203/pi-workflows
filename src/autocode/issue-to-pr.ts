@@ -10,10 +10,19 @@ import { agent, compute, defineWorkflow } from "../workflows/definition.js";
 import { WorkflowEngine } from "../workflows/engine.js";
 import type { AgentStepExecutor, AgentStepRequest } from "../workflows/types.js";
 import { waitForCi } from "./ci-wait.js";
+import {
+  DEFAULT_REPO,
+  gatePath,
+  loadRepos,
+  repoName,
+  requireRepo,
+  type RepoConfig,
+} from "./repos.js";
 
-const REPO = "komorebi2203/autocode-sandbox";
 const ROOT = "/srv/piw";
 type Input = {
+  repo: string;
+  repoConfig: RepoConfig;
   issue?: number;
   linearIdentifier?: string;
   taskFile?: string;
@@ -31,6 +40,7 @@ type TreeFingerprint = { status: string; diffHash: string };
 type RunEventState = "running" | "pr" | "gate" | "blocked" | "failed" | "completed";
 type RunEvent = {
   state: RunEventState;
+  repo?: string;
   reason?: string;
   pr?: number;
   prUrl?: string;
@@ -44,6 +54,7 @@ type RunEventEmitter = (event: RunEvent) => void;
 type StepName = "plan" | "implement" | "review";
 type PromptHashes = Partial<Record<StepName, string>>;
 export type RunProvenance = {
+  repo: string;
   prompt_sha256: Record<StepName, string>;
   model: Record<StepName, { routing: unknown; cli_version: string }>;
   sandbox: Record<StepName, string>;
@@ -69,13 +80,16 @@ export function collectProvenance(
   worktree: string,
   promptHashes: PromptHashes,
   headSha: string,
+  repo = DEFAULT_REPO,
+  base = "main",
 ): RunProvenance {
   const routingText = readFileSync("/opt/piw/routing.json", "utf8");
   const routing = JSON.parse(routingText) as { roles: Record<StepName, unknown> };
   const policyHash = sha256(readFileSync("/opt/piw/bin/piw-plan-sandbox"));
-  const baseSha = run("git", ["rev-parse", "origin/main"], worktree);
-  const diff = runBytes("git", ["diff", "--binary", "origin/main...HEAD"], worktree);
+  const baseSha = run("git", ["rev-parse", `origin/${base}`], worktree);
+  const diff = runBytes("git", ["diff", "--binary", `origin/${base}...HEAD`], worktree);
   return {
+    repo,
     prompt_sha256: Object.fromEntries(
       (["plan", "implement", "review"] as const).map((step) => {
         const hash = promptHashes[step];
@@ -272,15 +286,22 @@ export function createIssueToPrWorkflow(
           const value = input as Input;
           if (!value.worktree.startsWith(`${ROOT}/work/`))
             throw new Error("worktree escaped authorized root");
-          const mirror = `${ROOT}/repos/autocode-sandbox`;
+          const mirror = `${ROOT}/repos/${repoName(value.repo)}`;
           mkdirSync(dirname(value.worktree), { recursive: true });
-          if (!existsSync(join(mirror, ".git"))) run("gh", ["repo", "clone", REPO, mirror]);
-          run("git", ["fetch", "origin", "main"], mirror);
+          if (!existsSync(join(mirror, ".git"))) run("gh", ["repo", "clone", value.repo, mirror]);
+          run("git", ["fetch", "origin", value.repoConfig.base], mirror);
           rmSync(value.worktree, { recursive: true, force: true });
           run("git", ["worktree", "prune"], mirror);
           run(
             "git",
-            ["worktree", "add", "-b", value.branch, value.worktree, "origin/main"],
+            [
+              "worktree",
+              "add",
+              "-b",
+              value.branch,
+              value.worktree,
+              `origin/${value.repoConfig.base}`,
+            ],
             mirror,
           );
           run("git", ["config", "user.name", "pi-workflows"], value.worktree);
@@ -296,7 +317,7 @@ export function createIssueToPrWorkflow(
                   "view",
                   String(value.issue),
                   "-R",
-                  REPO,
+                  value.repo,
                   "--json",
                   "number,title,body,url",
                 ],
@@ -337,10 +358,11 @@ export function createIssueToPrWorkflow(
         expectedOutput: "A concise implementation summary.",
       }),
       verify: compute({
-        statusDetail: "running npm test",
+        statusDetail: "running repository verification",
         run: ({ input }) => {
           const value = input as Input;
-          const result = spawnSync("npm", ["test"], {
+          const [command, ...args] = value.repoConfig.verify;
+          const result = spawnSync(command, args, {
             cwd: value.worktree,
             encoding: "utf8",
             timeout: 15 * 60_000,
@@ -353,7 +375,11 @@ export function createIssueToPrWorkflow(
           if (result.status === 0) return { route: "continue" } satisfies Route;
           verifyFailures += 1;
           return verifyFailures <= 2
-            ? { route: "retry", reason: "verify", detail: "npm test failed" }
+            ? {
+                route: "retry",
+                reason: "verify",
+                detail: `${value.repoConfig.verify.join(" ")} failed`,
+              }
             : { route: "blocked", reason: "verify" };
         },
       }),
@@ -418,11 +444,11 @@ export function createIssueToPrWorkflow(
               "create",
               "--draft",
               "-R",
-              REPO,
+              value.repo,
               "--head",
               value.branch,
               "--base",
-              "main",
+              value.repoConfig.base,
               "--title",
               value.taskTitle ?? `feat: resolve ${taskRef}`,
               "--body",
@@ -437,7 +463,7 @@ export function createIssueToPrWorkflow(
           const opened = JSON.parse(
             run(
               "gh",
-              ["pr", "view", url, "-R", REPO, "--json", "number,headRefOid,url"],
+              ["pr", "view", url, "-R", value.repo, "--json", "number,headRefOid,url"],
               value.worktree,
             ),
           ) as { number: number; headRefOid: string; url: string };
@@ -450,26 +476,39 @@ export function createIssueToPrWorkflow(
         run: async ({ input, outputs }) => {
           const value = input as Input;
           const pr = outputs.pr as { number: number; headRefOid: string; url: string };
-          const ci = await waitForCi(REPO, pr.headRefOid);
+          const ci = await waitForCi(value.repo, pr.headRefOid);
           if (!ci.green) throw new Error(ci.reason);
           const current = JSON.parse(
             run(
               "gh",
-              ["pr", "view", String(pr.number), "-R", REPO, "--json", "headRefOid,state"],
+              ["pr", "view", String(pr.number), "-R", value.repo, "--json", "headRefOid,state"],
               value.worktree,
             ),
           ) as { headRefOid: string; state: string };
           if (current.state !== "OPEN" || current.headRefOid !== pr.headRefOid)
             throw new Error("PR head changed before gate creation");
-          const provenance = collectProvenance(value.worktree, promptHashes, pr.headRefOid);
-          const path = join(ROOT, "state", "gates", `pr-${pr.number}.json`);
+          const provenance = collectProvenance(
+            value.worktree,
+            promptHashes,
+            pr.headRefOid,
+            value.repo,
+            value.repoConfig.base,
+          );
+          const path = gatePath(value.repo, pr.number);
           mkdirSync(dirname(path), { recursive: true });
           writeFileSync(
             path,
-            `${JSON.stringify({ schema: "piw.local-gate.v1", repository: REPO, issue: value.issue, pr: pr.number, sha: pr.headRefOid, status: "pending-human-merge", createdAt: new Date().toISOString() }, null, 2)}\n`,
+            `${JSON.stringify({ schema: "piw.local-gate.v1", repo: value.repo, repository: value.repo, issue: value.issue, pr: pr.number, sha: pr.headRefOid, status: "pending-human-merge", createdAt: new Date().toISOString() }, null, 2)}\n`,
             { mode: 0o600 },
           );
-          emit({ state: "gate", pr: pr.number, prUrl: pr.url, headSha: pr.headRefOid, provenance });
+          emit({
+            state: "gate",
+            repo: value.repo,
+            pr: pr.number,
+            prUrl: pr.url,
+            headSha: pr.headRefOid,
+            provenance,
+          });
           return {
             status: "completed",
             pr: pr.number,
@@ -512,7 +551,7 @@ export function createIssueToPrWorkflow(
 }
 
 function usage(): never {
-  console.error("usage: issue-to-pr (--issue NUMBER | --task-file PATH)");
+  console.error("usage: issue-to-pr [--repo OWNER/NAME] (--issue NUMBER | --task-file PATH)");
   process.exit(2);
 }
 export async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -524,6 +563,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const requestedRunId = ri >= 0 ? argv[ri + 1] : undefined;
   if (requestedRunId !== undefined && !/^[A-Za-z0-9._:-]{1,128}$/u.test(requestedRunId)) usage();
   const runId = requestedRunId ?? generatedRunId;
+  const repoAt = argv.indexOf("--repo");
+  const repo = repoAt >= 0 ? (argv[repoAt + 1] ?? "") : DEFAULT_REPO;
   let revision = 0;
   let latestState: RunEventState = "running";
   let latestPr: Omit<RunEvent, "state"> = {};
@@ -547,6 +588,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       ...(event.reason === undefined ? {} : { reason: event.reason.slice(0, 2000) }),
       ...(event.heartbeat === undefined ? {} : { heartbeat: event.heartbeat }),
       ...(taskFile === undefined ? {} : { taskFile }),
+      repo,
       ...(event.provenance === undefined ? {} : { provenance: event.provenance }),
     };
     const submitted = spawnSync(
@@ -566,6 +608,22 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const terminal = new TerminalEventGuard(relayEmit);
   let heartbeat: NodeJS.Timeout | undefined;
   try {
+    let repos: Record<string, RepoConfig>;
+    try {
+      repos = loadRepos();
+    } catch (error) {
+      terminal.fail(`repo-not-allowed`);
+      throw error;
+    }
+    let repoConfig: RepoConfig;
+    try {
+      repoConfig = requireRepo(repos, repo);
+    } catch {
+      terminal.fail("repo-not-allowed");
+      console.error("failed: repo-not-allowed");
+      process.exitCode = 1;
+      return;
+    }
     const at = argv.indexOf("--issue");
     const tf = argv.indexOf("--task-file");
     if (
@@ -595,6 +653,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       taskTitle = task.title;
     }
     const input: Input = {
+      repo,
+      repoConfig,
       ...(issue === undefined ? {} : { issue }),
       ...(taskFile === undefined ? {} : { taskFile }),
       ...(linearIdentifier === undefined ? {} : { linearIdentifier }),
