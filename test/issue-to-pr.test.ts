@@ -7,6 +7,7 @@ import {
   assertReviewUnmodified,
   blockedOutcome,
   changedAssertions,
+  stageNewFiles,
   createIssueToPrWorkflow,
   settledWorkflowStatus,
   TerminalEventGuard,
@@ -20,6 +21,9 @@ import { compute, defineWorkflow } from "../src/workflows/definition.js";
 import { WorkflowEngine } from "../src/workflows/engine.js";
 import { makeStateDatabasePath, ScriptedExecutor } from "./helpers.js";
 
+function diffNames(cwd: string): string {
+  return execFileSync("git", ["diff", "--name-only", "HEAD"], { cwd, encoding: "utf8" }).trim();
+}
 function git(cwd: string, args: string[]): void {
   execFileSync("git", args, { cwd });
 }
@@ -165,6 +169,21 @@ describe("issue-to-pr workflow", () => {
     expect(changedAssertions(cwd)).toEqual([]);
     writeFileSync(join(cwd, "math.test.js"), "expect(add(2, 3)).toBe(6);\n");
     expect(changedAssertions(cwd)).toEqual(["math.test.js"]);
+  });
+
+  it("makes a new untracked file visible to git diff without staging piw scratch files", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "issue-to-pr-new-file-"));
+    git(cwd, ["init", "-b", "main"]);
+    git(cwd, ["config", "user.email", "test@example.invalid"]);
+    git(cwd, ["config", "user.name", "Test"]);
+    writeFileSync(join(cwd, "a.js"), "1\n");
+    git(cwd, ["add", "."]);
+    git(cwd, ["commit", "-m", "base"]);
+    writeFileSync(join(cwd, "new.test.js"), "expect(true).toBe(true);\n");
+    writeFileSync(join(cwd, ".piw-plan.md"), "plan\n");
+    expect(diffNames(cwd)).toBe("");
+    stageNewFiles(cwd);
+    expect(diffNames(cwd)).toBe("new.test.js");
   });
 
   it("guards against the configured base ref, not a hardcoded main", () => {

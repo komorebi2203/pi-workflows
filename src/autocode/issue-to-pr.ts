@@ -281,6 +281,11 @@ export function changedAssertions(worktree: string, baseRef = "main"): string[] 
   return [...new Set(found)];
 }
 
+/** Marks new files intent-to-add so review, guard and assertion checks see them in `git diff`. */
+export function stageNewFiles(worktree: string): void {
+  run("git", ["add", "--intent-to-add", "--all", "--", ".", ":(exclude).piw-*"], worktree);
+}
+
 export function treeFingerprint(worktree: string): TreeFingerprint {
   const status = run("git", ["status", "--porcelain"], worktree);
   const diff = run("git", ["diff", "--binary", "HEAD"], worktree);
@@ -457,7 +462,10 @@ export function createIssueToPrWorkflow(
           '{ "route": "continue|retry|failed", "reason": "optional", "detail": "optional" }',
       }),
       beforeReview: compute({
-        run: ({ input }) => treeFingerprint((input as Input).worktree),
+        run: ({ input }) => {
+          stageNewFiles((input as Input).worktree);
+          return treeFingerprint((input as Input).worktree);
+        },
       }),
       assessReview: compute({
         run: ({ input, outputs }) => {
