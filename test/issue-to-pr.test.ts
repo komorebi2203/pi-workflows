@@ -14,6 +14,7 @@ import {
   PLAN_PROMPT,
   REVIEW_PROMPT,
   implementPrompt,
+  runVerifySandbox,
 } from "../src/autocode/issue-to-pr.js";
 import { compute, defineWorkflow } from "../src/workflows/definition.js";
 import { WorkflowEngine } from "../src/workflows/engine.js";
@@ -88,6 +89,35 @@ describe("issue-to-pr workflow", () => {
       from: "guard",
       switch: { on: "$.route", cases: { continue: "pr", blocked: "blocked" } },
     });
+  });
+
+  it("fails closed when the verify sandbox cannot start", () => {
+    const calls: Array<{ command: string; args: readonly string[] }> = [];
+    const result = runVerifySandbox(
+      "/srv/piw/work/fail-closed-fixture",
+      ["sh", "-c", "touch unsandboxed-marker"],
+      false,
+      ((command: string, args: readonly string[]) => {
+        calls.push({ command, args });
+        return {
+          pid: 0,
+          output: [null, "", ""],
+          stdout: "",
+          stderr: "simulated bwrap failure",
+          status: null,
+          signal: null,
+          error: new Error("spawn failed"),
+        };
+      }) as typeof import("node:child_process").spawnSync,
+    );
+    expect(calls).toEqual([
+      {
+        command: "/opt/piw/bin/piw-verify-sandbox",
+        args: ["--", "sh", "-c", "touch unsandboxed-marker"],
+      },
+    ]);
+    expect(result.status).toBeNull();
+    expect(result.error?.message).toBe("spawn failed");
   });
 
   it("settles a blocked run with a reason and JSON-safe output", async () => {

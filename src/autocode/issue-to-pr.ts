@@ -57,7 +57,8 @@ export type RunProvenance = {
   repo: string;
   prompt_sha256: Record<StepName, string>;
   model: Record<StepName, { routing: unknown; cli_version: string }>;
-  sandbox: Record<StepName, string>;
+  sandbox: Record<StepName | "verify", string>;
+  install_argv: string[] | null;
   routing_sha256: string;
   diff_sha256: string;
   base_sha: string;
@@ -82,10 +83,14 @@ export function collectProvenance(
   headSha: string,
   repo = DEFAULT_REPO,
   base = "main",
+  installArgv: string[] | undefined = undefined,
 ): RunProvenance {
   const routingText = readFileSync("/opt/piw/routing.json", "utf8");
-  const routing = JSON.parse(routingText) as { roles: Record<StepName, unknown> };
+  const routing = JSON.parse(routingText) as {
+    roles: Record<StepName, unknown>;
+  };
   const policyHash = sha256(readFileSync("/opt/piw/bin/piw-plan-sandbox"));
+  const verifyPolicyHash = sha256(readFileSync("/opt/piw/bin/piw-verify-sandbox"));
   const baseSha = run("git", ["rev-parse", `origin/${base}`], worktree);
   const diff = runBytes("git", ["diff", "--binary", `origin/${base}...HEAD`], worktree);
   return {
@@ -98,19 +103,63 @@ export function collectProvenance(
       }),
     ) as Record<StepName, string>,
     model: {
-      plan: { routing: routing.roles.plan, cli_version: run("claude", ["--version"]) },
-      implement: { routing: routing.roles.implement, cli_version: run("codex", ["--version"]) },
-      review: { routing: routing.roles.review, cli_version: run("codex", ["--version"]) },
+      plan: {
+        routing: routing.roles.plan,
+        cli_version: run("claude", ["--version"]),
+      },
+      implement: {
+        routing: routing.roles.implement,
+        cli_version: run("codex", ["--version"]),
+      },
+      review: {
+        routing: routing.roles.review,
+        cli_version: run("codex", ["--version"]),
+      },
     },
     sandbox: {
       plan: `piw-plan-sandbox policy_sha256=${policyHash}`,
       implement: "codex workspace-write",
       review: "codex read-only",
+      verify: `piw-verify-sandbox policy_sha256=${verifyPolicyHash}`,
     },
+    install_argv: installArgv ?? null,
     routing_sha256: sha256(routingText),
     diff_sha256: sha256(diff),
     base_sha: baseSha,
     head_sha: headSha,
+  };
+}
+
+export type SandboxedCommandResult = {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+};
+
+type SpawnVerify = typeof spawnSync;
+
+export function runVerifySandbox(
+  worktree: string,
+  argv: [string, ...string[]],
+  shareNet = false,
+  spawn: SpawnVerify = spawnSync,
+): SandboxedCommandResult {
+  const result = spawn(
+    "/opt/piw/bin/piw-verify-sandbox",
+    [...(shareNet ? ["--share-net"] : []), "--", ...argv],
+    {
+      cwd: worktree,
+      env: { ...process.env, PIW_WORKTREE: worktree },
+      encoding: "utf8",
+      timeout: 15 * 60_000,
+    },
+  );
+  return {
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    ...(result.error === undefined ? {} : { error: result.error }),
   };
 }
 
@@ -166,7 +215,10 @@ function run(command: string, args: string[], cwd?: string): string {
   }).trim();
 }
 function runBytes(command: string, args: string[], cwd?: string): Buffer {
-  return execFileSync(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+  return execFileSync(command, args, {
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 }
 function inputParser(value: unknown): Input {
   const valueInput = value as Partial<Input>;
@@ -327,7 +379,9 @@ export function createIssueToPrWorkflow(
               throw new Error(`issue-read:${errorMessage(error)}`);
             }
           }
-          writeFileSync(join(value.worktree, ".piw-issue.json"), `${issue}\n`, { mode: 0o600 });
+          writeFileSync(join(value.worktree, ".piw-issue.json"), `${issue}\n`, {
+            mode: 0o600,
+          });
           execFileSync("/opt/piw/bin/t6-skills-check", [], {
             cwd: value.worktree,
             env: { ...process.env, PIW_WORKTREE: value.worktree },
@@ -351,7 +405,10 @@ export function createIssueToPrWorkflow(
       }),
       implement: agent({
         executor: "cli",
-        cli: { command: "/opt/piw/bin/piw-role", args: ["implement", "{prompt}"] },
+        cli: {
+          command: "/opt/piw/bin/piw-role",
+          args: ["implement", "{prompt}"],
+        },
         timeoutMs: 45 * 60_000,
         statusDetail: "implementing",
         prompt: ({ outputs }) => implementPrompt(outputs.plan),
@@ -361,18 +418,23 @@ export function createIssueToPrWorkflow(
         statusDetail: "running repository verification",
         run: ({ input }) => {
           const value = input as Input;
-          const [command, ...args] = value.repoConfig.verify;
-          const result = spawnSync(command, args, {
-            cwd: value.worktree,
-            encoding: "utf8",
-            timeout: 15 * 60_000,
-          });
+          const results: SandboxedCommandResult[] = [];
+          if (value.repoConfig.install)
+            results.push(runVerifySandbox(value.worktree, value.repoConfig.install, true));
+          if (results.every((result) => result.status === 0))
+            results.push(runVerifySandbox(value.worktree, value.repoConfig.verify));
           writeFileSync(
             join(value.worktree, ".piw-verify.log"),
-            `${result.stdout ?? ""}\n${result.stderr ?? ""}`,
+            results
+              .map(
+                (result) =>
+                  `${result.stdout}\n${result.stderr}${result.error ? `\n${result.error.message}` : ""}`,
+              )
+              .join("\n"),
             { mode: 0o600 },
           );
-          if (result.status === 0) return { route: "continue" } satisfies Route;
+          if (results.length > 0 && results.every((result) => result.status === 0))
+            return { route: "continue" } satisfies Route;
           verifyFailures += 1;
           return verifyFailures <= 2
             ? {
@@ -418,9 +480,17 @@ export function createIssueToPrWorkflow(
           const worktree = (input as Input).worktree;
           const files = changedAssertions(worktree);
           if (run("git", ["diff", "--name-only", "HEAD"], worktree) === "")
-            return { route: "blocked", reason: "review", detail: "no implementation changes" };
+            return {
+              route: "blocked",
+              reason: "review",
+              detail: "no implementation changes",
+            };
           return files.length
-            ? { route: "blocked", reason: "test-guard", detail: files.join(", ") }
+            ? {
+                route: "blocked",
+                reason: "test-guard",
+                detail: files.join(", "),
+              }
             : { route: "continue" };
         },
       }),
@@ -467,7 +537,12 @@ export function createIssueToPrWorkflow(
               value.worktree,
             ),
           ) as { number: number; headRefOid: string; url: string };
-          emit({ state: "pr", pr: opened.number, prUrl: opened.url, headSha: opened.headRefOid });
+          emit({
+            state: "pr",
+            pr: opened.number,
+            prUrl: opened.url,
+            headSha: opened.headRefOid,
+          });
           return opened;
         },
       }),
@@ -475,7 +550,11 @@ export function createIssueToPrWorkflow(
         statusDetail: "waiting for CI and writing the gate",
         run: async ({ input, outputs }) => {
           const value = input as Input;
-          const pr = outputs.pr as { number: number; headRefOid: string; url: string };
+          const pr = outputs.pr as {
+            number: number;
+            headRefOid: string;
+            url: string;
+          };
           const ci = await waitForCi(value.repo, pr.headRefOid);
           if (!ci.green) throw new Error(ci.reason);
           const current = JSON.parse(
@@ -493,6 +572,7 @@ export function createIssueToPrWorkflow(
             pr.headRefOid,
             value.repo,
             value.repoConfig.base,
+            value.repoConfig.install,
           );
           const path = gatePath(value.repo, pr.number);
           mkdirSync(dirname(path), { recursive: true });
@@ -532,7 +612,11 @@ export function createIssueToPrWorkflow(
         from: "verify",
         switch: {
           on: "$.route",
-          cases: { continue: "beforeReview", retry: "implement", blocked: "blocked" },
+          cases: {
+            continue: "beforeReview",
+            retry: "implement",
+            blocked: "blocked",
+          },
         },
       },
       { from: "beforeReview", to: "review" },
@@ -544,7 +628,13 @@ export function createIssueToPrWorkflow(
           cases: { continue: "guard", retry: "implement", blocked: "blocked" },
         },
       },
-      { from: "guard", switch: { on: "$.route", cases: { continue: "pr", blocked: "blocked" } } },
+      {
+        from: "guard",
+        switch: {
+          on: "$.route",
+          cases: { continue: "pr", blocked: "blocked" },
+        },
+      },
       { from: "pr", to: "gate" },
     ],
   });
@@ -674,7 +764,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     );
     heartbeat.unref();
     const promptHashes: PromptHashes = {};
-    const cliExecutor = new CliStepExecutor({ cwd: ROOT, env: { PIW_WORKTREE: input.worktree } });
+    const cliExecutor = new CliStepExecutor({
+      cwd: ROOT,
+      env: { PIW_WORKTREE: input.worktree },
+    });
     const executor: AgentStepExecutor = {
       assistantMessageMode: "unsupported",
       async runAgentStep(request: AgentStepRequest, signal: AbortSignal) {

@@ -1,7 +1,11 @@
 import { readFileSync } from "node:fs";
 
 export const DEFAULT_REPO = "komorebi2203/autocode-sandbox";
-export type RepoConfig = { verify: [string, ...string[]]; base: string };
+export type RepoConfig = {
+  verify: [string, ...string[]];
+  install?: [string, ...string[]];
+  base: string;
+};
 
 export function loadRepos(
   path = process.env.PIW_REPOS_CONFIG ?? "/etc/piw-relay/repos.json",
@@ -25,16 +29,26 @@ export function loadRepos(
     if (slug.includes("..") || !/^komorebi2203\/[A-Za-z0-9._-]+$/u.test(slug))
       throw new Error(`repo-slug-invalid:${slug}`);
     const config = raw as Partial<RepoConfig>;
+    const validArgv = (argv: unknown): argv is [string, ...string[]] =>
+      Array.isArray(argv) &&
+      argv.length > 0 &&
+      argv.every((part) => typeof part === "string" && part.length > 0);
     if (
       !config ||
-      !Array.isArray(config.verify) ||
-      config.verify.length === 0 ||
-      !config.verify.every((part) => typeof part === "string" && part.length > 0) ||
+      !validArgv(config.verify) ||
+      (config.install !== undefined && !validArgv(config.install)) ||
       typeof config.base !== "string" ||
       !/^[A-Za-z0-9._/-]+$/u.test(config.base) ||
       config.base.includes("..")
     )
       throw new Error(`repo-config-invalid:${slug}`);
+    if (
+      config.install?.[0] === "npm" &&
+      !config.install.some(
+        (part) => part === "--ignore-scripts" || part === "--ignore-scripts=true",
+      )
+    )
+      throw new Error(`repo-install-scripts-enabled:${slug}`);
   }
   return repos as Record<string, RepoConfig>;
 }
