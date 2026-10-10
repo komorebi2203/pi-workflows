@@ -11,6 +11,9 @@ import {
   settledWorkflowStatus,
   TerminalEventGuard,
   treeFingerprint,
+  PLAN_PROMPT,
+  REVIEW_PROMPT,
+  implementPrompt,
 } from "../src/autocode/issue-to-pr.js";
 import { compute, defineWorkflow } from "../src/workflows/definition.js";
 import { WorkflowEngine } from "../src/workflows/engine.js";
@@ -21,6 +24,11 @@ function git(cwd: string, args: string[]): void {
 }
 
 describe("issue-to-pr workflow", () => {
+  it("keeps the exact auditable agent prompts available", () => {
+    expect(PLAN_PROMPT).toContain("Do not change files");
+    expect(implementPrompt("one\ntwo")).toContain("Plan:\none\ntwo");
+    expect(REVIEW_PROMPT).toContain("Do not edit files");
+  });
   it("emits exactly one failed event for a forced issue-read throw", () => {
     const events: Array<{ state: string; reason?: string }> = [];
     const guard = new TerminalEventGuard((event) => events.push(event));

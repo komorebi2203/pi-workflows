@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { CliStepExecutor } from "../server/cli-executor.js";
 import { agent, compute, defineWorkflow } from "../workflows/definition.js";
 import { WorkflowEngine } from "../workflows/engine.js";
+import type { AgentStepExecutor, AgentStepRequest } from "../workflows/types.js";
 import { waitForCi } from "./ci-wait.js";
 
 const REPO = "komorebi2203/autocode-sandbox";
@@ -36,8 +37,68 @@ type RunEvent = {
   headSha?: string;
   heartbeat?: boolean;
   taskFile?: string;
+  provenance?: RunProvenance;
 };
 type RunEventEmitter = (event: RunEvent) => void;
+
+type StepName = "plan" | "implement" | "review";
+type PromptHashes = Partial<Record<StepName, string>>;
+export type RunProvenance = {
+  prompt_sha256: Record<StepName, string>;
+  model: Record<StepName, { routing: unknown; cli_version: string }>;
+  sandbox: Record<StepName, string>;
+  routing_sha256: string;
+  diff_sha256: string;
+  base_sha: string;
+  head_sha: string;
+};
+
+export const PLAN_PROMPT =
+  "Read .piw-issue.json, which contains the authorized task. Print a short implementation and verification plan as plain stdout text. Do not use or mention a workflow submission tool. Do not change files.";
+export const REVIEW_PROMPT =
+  'Review git diff against main. Print only stdout JSON: {"route":"continue"} if there are no P0/P1 findings, otherwise {"route":"retry","detail":"actionable findings"}. Do not use or mention a workflow submission tool. Do not edit files.';
+export function implementPrompt(plan: unknown): string {
+  return `Implement the task in .piw-issue.json. Plan:\n${String(plan)}\nInspect .piw-verify.log if present. Do not commit, push, open a PR, or modify an existing test assertion.`;
+}
+
+function sha256(value: string | Buffer): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+export function collectProvenance(
+  worktree: string,
+  promptHashes: PromptHashes,
+  headSha: string,
+): RunProvenance {
+  const routingText = readFileSync("/opt/piw/routing.json", "utf8");
+  const routing = JSON.parse(routingText) as { roles: Record<StepName, unknown> };
+  const policyHash = sha256(readFileSync("/opt/piw/bin/piw-plan-sandbox"));
+  const baseSha = run("git", ["rev-parse", "origin/main"], worktree);
+  const diff = runBytes("git", ["diff", "--binary", "origin/main...HEAD"], worktree);
+  return {
+    prompt_sha256: Object.fromEntries(
+      (["plan", "implement", "review"] as const).map((step) => {
+        const hash = promptHashes[step];
+        if (hash === undefined) throw new Error(`missing exact prompt hash for ${step}`);
+        return [step, hash];
+      }),
+    ) as Record<StepName, string>,
+    model: {
+      plan: { routing: routing.roles.plan, cli_version: run("claude", ["--version"]) },
+      implement: { routing: routing.roles.implement, cli_version: run("codex", ["--version"]) },
+      review: { routing: routing.roles.review, cli_version: run("codex", ["--version"]) },
+    },
+    sandbox: {
+      plan: `piw-plan-sandbox policy_sha256=${policyHash}`,
+      implement: "codex workspace-write",
+      review: "codex read-only",
+    },
+    routing_sha256: sha256(routingText),
+    diff_sha256: sha256(diff),
+    base_sha: baseSha,
+    head_sha: headSha,
+  };
+}
 
 export class TerminalEventGuard {
   private terminal = false;
@@ -89,6 +150,9 @@ function run(command: string, args: string[], cwd?: string): string {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
+}
+function runBytes(command: string, args: string[], cwd?: string): Buffer {
+  return execFileSync(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
 }
 function inputParser(value: unknown): Input {
   const valueInput = value as Partial<Input>;
@@ -178,7 +242,10 @@ export function settledWorkflowStatus(engineStatus: string, finalOutput: unknown
     : engineStatus;
 }
 
-export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined) {
+export function createIssueToPrWorkflow(
+  emit: RunEventEmitter = () => undefined,
+  promptHashes: PromptHashes = {},
+) {
   let verifyFailures = 0;
   let reviewFailures = 0;
   return defineWorkflow({
@@ -195,7 +262,6 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
         statusDetail: "checking subscription credentials",
         run: () => {
           run("/opt/piw/bin/piw-preflight", ["--agent-dir", "/home/piw/.pi/agent"]);
-          run("/opt/piw/bin/t6-skills-check", []);
           assertRouting();
           return { route: "continue" };
         },
@@ -241,6 +307,11 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
             }
           }
           writeFileSync(join(value.worktree, ".piw-issue.json"), `${issue}\n`, { mode: 0o600 });
+          execFileSync("/opt/piw/bin/t6-skills-check", [], {
+            cwd: value.worktree,
+            env: { ...process.env, PIW_WORKTREE: value.worktree },
+            stdio: ["ignore", "pipe", "pipe"],
+          });
           return { route: "continue" };
         },
       }),
@@ -248,8 +319,7 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
         executor: "cli",
         cli: { command: "/opt/piw/bin/piw-role", args: ["plan", "{prompt}"] },
         statusDetail: "planning from the issue",
-        prompt: () =>
-          `Read .piw-issue.json, which contains the authorized task. Print a short implementation and verification plan as plain stdout text. Do not use or mention a workflow submission tool. Do not change files.`,
+        prompt: () => PLAN_PROMPT,
         expectedOutput: "A short plain-text plan.",
       }),
       savePlan: compute({
@@ -263,8 +333,7 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
         cli: { command: "/opt/piw/bin/piw-role", args: ["implement", "{prompt}"] },
         timeoutMs: 45 * 60_000,
         statusDetail: "implementing",
-        prompt: ({ outputs }) =>
-          `Implement the task in .piw-issue.json. Plan:\n${String(outputs.plan)}\nInspect .piw-verify.log if present. Do not commit, push, open a PR, or modify an existing test assertion.`,
+        prompt: ({ outputs }) => implementPrompt(outputs.plan),
         expectedOutput: "A concise implementation summary.",
       }),
       verify: compute({
@@ -293,8 +362,7 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
         cli: { command: "/opt/piw/bin/piw-role", args: ["review", "{prompt}"] },
         timeoutMs: 30 * 60_000,
         statusDetail: "reviewing",
-        prompt: () =>
-          'Review git diff against main. Print only stdout JSON: {"route":"continue"} if there are no P0/P1 findings, otherwise {"route":"retry","detail":"actionable findings"}. Do not use or mention a workflow submission tool. Do not edit files.',
+        prompt: () => REVIEW_PROMPT,
         expectedOutput:
           '{ "route": "continue|retry|failed", "reason": "optional", "detail": "optional" }',
       }),
@@ -393,6 +461,7 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
           ) as { headRefOid: string; state: string };
           if (current.state !== "OPEN" || current.headRefOid !== pr.headRefOid)
             throw new Error("PR head changed before gate creation");
+          const provenance = collectProvenance(value.worktree, promptHashes, pr.headRefOid);
           const path = join(ROOT, "state", "gates", `pr-${pr.number}.json`);
           mkdirSync(dirname(path), { recursive: true });
           writeFileSync(
@@ -400,7 +469,7 @@ export function createIssueToPrWorkflow(emit: RunEventEmitter = () => undefined)
             `${JSON.stringify({ schema: "piw.local-gate.v1", repository: REPO, issue: value.issue, pr: pr.number, sha: pr.headRefOid, status: "pending-human-merge", createdAt: new Date().toISOString() }, null, 2)}\n`,
             { mode: 0o600 },
           );
-          emit({ state: "gate", pr: pr.number, prUrl: pr.url, headSha: pr.headRefOid });
+          emit({ state: "gate", pr: pr.number, prUrl: pr.url, headSha: pr.headRefOid, provenance });
           return {
             status: "completed",
             pr: pr.number,
@@ -478,6 +547,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       ...(event.reason === undefined ? {} : { reason: event.reason.slice(0, 2000) }),
       ...(event.heartbeat === undefined ? {} : { heartbeat: event.heartbeat }),
       ...(taskFile === undefined ? {} : { taskFile }),
+      ...(event.provenance === undefined ? {} : { provenance: event.provenance }),
     };
     const submitted = spawnSync(
       "/opt/piw/bin/piw-relay-submit",
@@ -543,12 +613,23 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       Math.max(1, heartbeatMinutes) * 60_000,
     );
     heartbeat.unref();
+    const promptHashes: PromptHashes = {};
+    const cliExecutor = new CliStepExecutor({ cwd: ROOT, env: { PIW_WORKTREE: input.worktree } });
+    const executor: AgentStepExecutor = {
+      assistantMessageMode: "unsupported",
+      async runAgentStep(request: AgentStepRequest, signal: AbortSignal) {
+        const step = request.contract.nodeId;
+        if (step === "plan" || step === "implement" || step === "review")
+          promptHashes[step] = sha256(request.prompt);
+        return await cliExecutor.runAgentStep(request, signal);
+      },
+    };
     const engine = new WorkflowEngine({
-      executor: new CliStepExecutor({ cwd: ROOT, env: { PIW_WORKTREE: input.worktree } }),
+      executor,
       databasePath: `${ROOT}/state/workflows.sqlite`,
       defaultNodeTimeoutMs: 60 * 60_000,
     });
-    const result = await engine.run(createIssueToPrWorkflow(emit), input, { runId });
+    const result = await engine.run(createIssueToPrWorkflow(emit, promptHashes), input, { runId });
     const workflowStatus = settledWorkflowStatus(result.state.status, result.state.finalOutput);
     const reason =
       result.state.error ??
