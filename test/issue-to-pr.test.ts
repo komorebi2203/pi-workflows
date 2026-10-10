@@ -167,6 +167,19 @@ describe("issue-to-pr workflow", () => {
     expect(changedAssertions(cwd)).toEqual(["math.test.js"]);
   });
 
+  it("guards against the configured base ref, not a hardcoded main", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "issue-to-pr-master-guard-"));
+    git(cwd, ["init", "-b", "master"]);
+    git(cwd, ["config", "user.email", "test@example.invalid"]);
+    git(cwd, ["config", "user.name", "Test"]);
+    writeFileSync(join(cwd, "math.test.js"), "expect(add(2, 3)).toBe(5);\n");
+    git(cwd, ["add", "."]);
+    git(cwd, ["commit", "-m", "base"]);
+    writeFileSync(join(cwd, "math.test.js"), "expect(add(2, 3)).toBe(6);\n");
+    expect(() => changedAssertions(cwd)).toThrow();
+    expect(changedAssertions(cwd, "master")).toEqual(["math.test.js"]);
+  });
+
   it("detects a changed Node assert method assertion", () => {
     const cwd = mkdtempSync(join(tmpdir(), "issue-to-pr-node-assert-guard-"));
     git(cwd, ["init", "-b", "main"]);

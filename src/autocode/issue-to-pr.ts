@@ -67,8 +67,10 @@ export type RunProvenance = {
 
 export const PLAN_PROMPT =
   "Read .piw-issue.json, which contains the authorized task. Print a short implementation and verification plan as plain stdout text. Do not use or mention a workflow submission tool. Do not change files.";
-export const REVIEW_PROMPT =
-  'Review git diff against main. Print only stdout JSON: {"route":"continue"} if there are no P0/P1 findings, otherwise {"route":"retry","detail":"actionable findings"}. Do not use or mention a workflow submission tool. Do not edit files.';
+export function reviewPrompt(baseRef: string): string {
+  return `Review git diff against ${baseRef}. Print only stdout JSON: {"route":"continue"} if there are no P0/P1 findings, otherwise {"route":"retry","detail":"actionable findings"}. Do not use or mention a workflow submission tool. Do not edit files.`;
+}
+export const REVIEW_PROMPT = reviewPrompt("main");
 export function implementPrompt(plan: unknown): string {
   return `Implement the task in .piw-issue.json. Plan:\n${String(plan)}\nInspect .piw-verify.log if present. Do not commit, push, open a PR, or modify an existing test assertion.`;
 }
@@ -249,13 +251,13 @@ function assertRouting(): void {
     throw new Error("invalid primary role commands");
   readFileSync("/opt/piw/claude-plugins/MANIFEST", "utf8");
 }
-export function changedAssertions(worktree: string): string[] {
+export function changedAssertions(worktree: string, baseRef = "main"): string[] {
   const diff = run(
     "git",
     [
       "diff",
       "--unified=0",
-      "main",
+      baseRef,
       "--",
       "*.test.*",
       "*.spec.*",
@@ -450,7 +452,7 @@ export function createIssueToPrWorkflow(
         cli: { command: "/opt/piw/bin/piw-role", args: ["review", "{prompt}"] },
         timeoutMs: 30 * 60_000,
         statusDetail: "reviewing",
-        prompt: () => REVIEW_PROMPT,
+        prompt: ({ input }) => reviewPrompt(`origin/${(input as Input).repoConfig.base}`),
         expectedOutput:
           '{ "route": "continue|retry|failed", "reason": "optional", "detail": "optional" }',
       }),
@@ -478,7 +480,7 @@ export function createIssueToPrWorkflow(
         statusDetail: "guarding test assertions",
         run: ({ input }) => {
           const worktree = (input as Input).worktree;
-          const files = changedAssertions(worktree);
+          const files = changedAssertions(worktree, `origin/${(input as Input).repoConfig.base}`);
           if (run("git", ["diff", "--name-only", "HEAD"], worktree) === "")
             return {
               route: "blocked",
