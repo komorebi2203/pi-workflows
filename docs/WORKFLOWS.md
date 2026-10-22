@@ -757,7 +757,7 @@ The extension aborts only the cancelled workflow-owned Pi turn through public `c
 
 Autoimplement uses batches for pi-reviewer and pending CI watches. It keeps model turns, fixes, pushes, comment changes, merges, and releases in their existing order. Reviewer commands are tied to the repository, base branch, pushed head, and relevant dependency fingerprint. A later review round includes only repositories whose head or dependency fingerprint changed. P0 or P1 work still requires another review. P2-only work can be addressed and verified without another reviewer run only because of that P2 work.
 
-Autoimplement inspects every pull request before it waits for CI. It accepts only supported pending `gh pr checks --watch` or `gh run watch` descriptors and binds each one to the validated pull request as `gh pr checks <PR URL> --watch`. Repository and pull-request overrides are rejected. One watch lasts at most five minutes. A failed or timed-out watch affects only its pull request. When checks remain pending, the model runs more useful local tests before checking CI again. Autoimplement does not invent an ETA.
+Autoimplement inspects every pull request before it waits for CI. Pending CI is read through Actions runs for the exact published head SHA, with failing commit statuses also treated as red. A missing Actions run never counts as green. One watch lasts at most five minutes. A failed or timed-out watch affects only its pull request. When runs remain pending, the model runs more useful local tests before checking CI again. Autoimplement does not invent an ETA.
 
 The action abort signal stops active command process groups and prevents queued commands from starting. Accepted outputs use immutable events and content-addressed blobs. An interrupted unaccepted batch runs again because batch commands are read-only or isolated local checks. Progress updates contain metadata only and never control routing. Truncated reviewer or CI output cannot count as clean. See [Run independent commands in bounded batches](plans/2026-08-20-bounded-command-batches-plan.md) for the complete contract and implementation plan.
 
@@ -1089,6 +1089,35 @@ The engine remains Pi-agnostic. `WorkflowEngine` takes any `AgentStepExecutor`,
 so tests and custom library integrations can script agent steps. The package's
 production extension does not use this as a selectable embedded runtime; it
 always sends runs to the global server.
+
+### External CLI agent steps
+
+An agent node can opt into a fresh external process instead of the run's Pi
+session. Set `executor: "cli"` and provide `cli.command` plus optional
+`cli.args`. Every `{prompt}` occurrence in an argument is replaced by the full
+step prompt; when no argument contains that marker, the prompt is appended as
+the final argument. The command must exit zero. A stdout JSON value becomes
+structured output; other stdout becomes a trimmed string. The result is
+validated and persisted through the normal node output, gate, transition, and
+event-log path.
+
+```typescript
+agent({
+  executor: "cli",
+  cli: {
+    command: "codex",
+    args: ["exec", "--skip-git-repo-check", "{prompt}"],
+  },
+  prompt: () => "Return a JSON object with an answer field.",
+  validate: (output) => output,
+});
+```
+
+A non-zero process exit fails the node immediately. Its error records the exit
+code and either `reason=quota` for recognizable quota/usage/rate-limit output or
+`reason=command` for other failures. The engine does not traverse outgoing
+edges after either failure. CLI nodes produce submitted JSON and therefore
+cannot use `assistantMessage()` output or a Pi-specific `model` override.
 
 ```typescript
 import { WorkflowEngine, type AgentStepExecutor } from "@osolmaz/pi-workflows";

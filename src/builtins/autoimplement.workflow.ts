@@ -2008,11 +2008,11 @@ export const autoimplementWorkflow = defineWorkflow({
           "Inspect every published pull request once without waiting for completion.",
           "Return one target per repository and current PR head.",
           "Choose green, failed, pending, or unavailable for each target.",
-          "When pending, provide an exact supported gh pr checks --watch or gh run watch command with the repository id, absolute repository cwd, timeoutMs at most 300000, and maxOutputChars at most 1000000. The workflow binds it to the target PR before execution.",
+          "When pending, provide piw-ci-wait with the repository slug and exact current head revision, plus the repository id, absolute repository cwd, timeoutMs at most 300000, and maxOutputChars at most 1000000.",
           "Separate failures caused by this change from unrelated failures. Do not invent an ETA.",
           `Published repositories: ${JSON.stringify(currentPublishedRepositories(context))}`,
         ].join("\n"),
-      expectedOutput: `{ "targets": [{ "repository": "/absolute/repository", "headRevision": "revision", "pr": "URL", "route": "green" | "failed" | "pending" | "unavailable", "reason": "status", "relatedFailures": ["failure"], "unrelatedFailures": ["failure"], "trackingCommand": { "id": "repository-id", "command": "gh", "args": ["pr", "checks", "PR URL", "--watch"], "cwd": "/absolute/repository", "timeoutMs": 300000, "maxOutputChars": 1000000 } }] }`,
+      expectedOutput: `{ "targets": [{ "repository": "/absolute/repository", "headRevision": "revision", "pr": "URL", "route": "green" | "failed" | "pending" | "unavailable", "reason": "status", "relatedFailures": ["failure"], "unrelatedFailures": ["failure"], "trackingCommand": { "id": "repository-id", "command": "piw-ci-wait", "args": ["owner/repository", "exact 40-character head revision"], "cwd": "/absolute/repository", "timeoutMs": 300000, "maxOutputChars": 1000000 } }] }`,
       validate: parseCiInspectionForPublished,
     }),
     routeInspectCiResult: compute({

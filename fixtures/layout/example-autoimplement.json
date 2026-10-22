@@ -129,7 +129,7 @@
         "nodeType": "agent",
         "timeoutMs": 600000,
         "statusDetail": "checking CI",
-        "expectedOutput": "{ \"targets\": [{ \"repository\": \"/absolute/repository\", \"headRevision\": \"revision\", \"pr\": \"URL\", \"route\": \"green\" | \"failed\" | \"pending\" | \"unavailable\", \"reason\": \"status\", \"relatedFailures\": [\"failure\"], \"unrelatedFailures\": [\"failure\"], \"trackingCommand\": { \"id\": \"repository-id\", \"command\": \"gh\", \"args\": [\"pr\", \"checks\", \"PR URL\", \"--watch\"], \"cwd\": \"/absolute/repository\", \"timeoutMs\": 300000, \"maxOutputChars\": 1000000 } }] }"
+        "expectedOutput": "{ \"targets\": [{ \"repository\": \"/absolute/repository\", \"headRevision\": \"revision\", \"pr\": \"URL\", \"route\": \"green\" | \"failed\" | \"pending\" | \"unavailable\", \"reason\": \"status\", \"relatedFailures\": [\"failure\"], \"unrelatedFailures\": [\"failure\"], \"trackingCommand\": { \"id\": \"repository-id\", \"command\": \"piw-ci-wait\", \"args\": [\"owner/repository\", \"exact 40-character head revision\"], \"cwd\": \"/absolute/repository\", \"timeoutMs\": 300000, \"maxOutputChars\": 1000000 } }] }"
       },
       "routeInspectCiResult": {
         "nodeType": "compute"
